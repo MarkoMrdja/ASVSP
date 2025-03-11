@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
-from pyhdfs import HdfsClient
+from hdfs import InsecureClient
 from ultralytics import YOLO  # Import YOLO from ultralytics
 from data_loader import ImageLoader, ProcessingStatus, HDFSStatus
 
@@ -21,7 +21,7 @@ class VehicleDetector:
     }
 
     def __init__(self, model_path: str = "/app/model/yolo11l.pt", 
-                 hdfs_namenode: str = "hdfs://namenode:9000"):
+                 hdfs_namenode: str = "http://namenode:9870"):
         """
         Initialize vehicle detector with YOLOv11 model
         
@@ -39,7 +39,7 @@ class VehicleDetector:
         
         # HDFS setup
         self.hdfs_namenode = hdfs_namenode
-        self.hdfs_client = HdfsClient(hosts=hdfs_namenode.replace('hdfs://', ''), user_name='root')
+        self.hdfs_client = InsecureClient(hdfs_namenode, user='root')
         
         # Cache for accumulating detections by border
         self.cached_detections = {}

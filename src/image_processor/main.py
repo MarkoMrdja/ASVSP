@@ -29,7 +29,7 @@ def parse_args():
                         help='Path to YOLO model weights')
     parser.add_argument('--hdfs-dir', type=str, default='/hdfs/raw/vehicle_detections',
                         help='HDFS directory to save detection results')
-    parser.add_argument('--hdfs-namenode', type=str, default='hdfs://namenode:9000',
+    parser.add_argument('--hdfs-namenode', type=str, default='http://namenode:9870',
                         help='HDFS namenode address')
     parser.add_argument('--max-parquet-size-mb', type=int, default=256,
                         help='Target size for Parquet files in MB')
