@@ -130,7 +130,7 @@ class VehicleDetector:
         return detections
 
     def save_detections_for_border(self, border: str, 
-                                  hdfs_dir: str = "/hdfs/raw/vehicle_detections") -> Optional[str]:
+                              hdfs_dir: str = "/hdfs/raw/vehicle_detections") -> Optional[str]:
         """
         Save accumulated detection results for a specific border to parquet file in HDFS
         
@@ -159,15 +159,19 @@ class VehicleDetector:
         # Ensure HDFS directory exists
         try:
             border_hdfs_dir = f"{hdfs_dir}/{border}"
-            if not self.hdfs_client.exists(border_hdfs_dir):
-                self.hdfs_client.mkdirs(border_hdfs_dir)
+            # Check if directory exists by trying to get its status
+            try:
+                self.hdfs_client.status(border_hdfs_dir)
+            except:
+                # If status check fails, directory doesn't exist, so create it
+                self.hdfs_client.makedirs(border_hdfs_dir)
         except Exception as e:
             print(f"Error creating HDFS directory: {e}")
             return None
         
         # Upload to HDFS
         try:
-            self.hdfs_client.copy_from_local(local_path, hdfs_path)
+            self.hdfs_client.upload(hdfs_path, local_path)
             detection_count = len(self.cached_detections[border])
             file_size_mb = os.path.getsize(local_path) / (1024 * 1024)
             print(f"Saved {detection_count} detections ({file_size_mb:.2f} MB) for border {border} to HDFS: {hdfs_path}")
