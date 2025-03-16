@@ -10,3 +10,4 @@ hdfs>=2.7.0
 requests>=2.25.1
 tqdm>=4.64.0
 ultralytics>=8.0.0
+zstandard>=0.15.0
