@@ -1,0 +1,181 @@
+services:
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    volumes:
+      - namenode:/hadoop/dfs/name
+      - ./src/test:/test
+      - ./data:/data
+      - ./src/hdfs/raw:/hdfs/raw
+      - ./src/hdfs/processed:/hdfs/processed
+      - ./src/hdfs/curated:/hdfs/curated
+    environment:
+      - CLUSTER_NAME=asvsp
+    env_file:
+      - ./src/config/config.env
+    ports:
+      - 9870:9870
+      - 9000:9000
+
+  datanode1:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode1
+    volumes:
+      - datanode1:/hadoop/dfs/data
+    env_file:
+      - ./src/config/config.env
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870"
+
+  datanode2:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode2
+    volumes:
+      - datanode2:/hadoop/dfs/data
+    env_file:
+      - ./src/config/config.env
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870"
+
+  spark-master:
+    image: bde2020/spark-master:3.0.1-hadoop3.2
+    container_name: spark-master
+    volumes:
+      - ./src/batch:/batch
+    ports:
+      - 8080:8080
+      - 7077:7077
+    environment:
+      - PYSPARK_PYTHON=python3
+    env_file:
+      - ./src/config/config.env
+
+  spark-worker1:
+    image: bde2020/spark-worker:3.0.1-hadoop3.2
+    container_name: spark-worker1
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+    ports:
+      - 8081:8081
+    env_file:
+      - ./src/config/config.env
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+  spark-worker2:
+    image: bde2020/spark-worker:3.0.1-hadoop3.2
+    container_name: spark-worker2
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+    ports:
+      - 8082:8081
+    env_file:
+      - ./src/config/config.env
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+  hive-server:
+    image: bde2020/hive:2.3.2-postgresql-metastore
+    container_name: hive-server
+    env_file:
+      - ./src/config/config.env
+    environment:
+      HIVE_CORE_CONF_javax_jdo_option_ConnectionURL: "jdbc:postgresql://hive-metastore/metastore"
+      SERVICE_PRECONDITION: "hive-metastore:9083"
+    ports:
+      - "10000:10000"
+
+  hive-metastore:
+    image: bde2020/hive:2.3.2-postgresql-metastore
+    container_name: hive-metastore
+    env_file:
+      - ./src/config/config.env
+    command: /opt/hive/bin/hive --service metastore
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870 datanode1:9864 datanode2:9864 hive-metastore-postgresql:5432"
+    ports:
+      - "9083:9083"
+
+  hive-metastore-postgresql:
+    image: bde2020/hive-metastore-postgresql:2.3.0
+    container_name: hive-metastore-postgresql
+
+  resourcemanager:
+    image: bde2020/hadoop-resourcemanager:2.0.0-hadoop3.2.1-java8
+    container_name: resourcemanager
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870"
+    env_file:
+      - ./src/config/config.env
+    ports:
+      - 8088:8088
+      - 8032:8032
+      - 8030:8030
+      - 8031:8031
+
+  nodemanager:
+    image: bde2020/hadoop-nodemanager:2.0.0-hadoop3.2.1-java8
+    container_name: nodemanager
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870 resourcemanager:8088"
+    env_file:
+      - ./src/config/config.env
+
+  historyserver:
+    image: bde2020/hadoop-historyserver:2.0.0-hadoop3.2.1-java8
+    container_name: historyserver
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870 resourcemanager:8088"
+    env_file:
+      - ./src/config/config.env
+    ports:
+      - 8188:8188
+
+  hue:
+    image: gethue/hue:20201111-135001
+    hostname: hue
+    container_name: hue
+    dns: 8.8.8.8
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./src/config/hue_config:/usr/share/hue/desktop/conf
+    depends_on:
+      - namenode
+      - resourcemanager
+      - historyserver
+
+  image-processor:
+    build:
+      context: ./src/image_processor
+    container_name: image-processor
+    volumes:
+      - ./src/image_processor:/app
+      - ./src/model:/app/model
+      - ./data:/data
+    env_file:
+      - ./src/config/config.env
+    environment:
+      - HDFS_NAMENODE=http://namenode:9870
+      - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING}
+    depends_on:
+      - namenode
+      - datanode1
+      - datanode2
+
+volumes:
+  namenode:
+  datanode1:
+  datanode2:
