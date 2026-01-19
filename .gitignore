@@ -1,6 +1,12 @@
 .idea
 __pycache__
 .env
+*.env
+!.env.example
 .venv
 .vscode
 logs
+.claude
+*.db
+storage/
+CLAUDE.md
