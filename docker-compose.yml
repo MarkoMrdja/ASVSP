@@ -111,6 +111,16 @@ services:
   hive-metastore-postgresql:
     image: bde2020/hive-metastore-postgresql:2.3.0
     container_name: hive-metastore-postgresql
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-hive}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-hive}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hive -d hive || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
 
   resourcemanager:
     image: bde2020/hadoop-resourcemanager:2.0.0-hadoop3.2.1-java8
@@ -170,10 +180,20 @@ services:
     environment:
       - HDFS_NAMENODE=http://namenode:9870
       - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING}
+      - POSTGRES_HOST=hive-metastore-postgresql
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=hive
+      - POSTGRES_USER=${POSTGRES_USER:-hive}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-hive}
     depends_on:
-      - namenode
-      - datanode1
-      - datanode2
+      namenode:
+        condition: service_started
+      datanode1:
+        condition: service_started
+      datanode2:
+        condition: service_started
+      hive-metastore-postgresql:
+        condition: service_healthy
 
 volumes:
   namenode:
