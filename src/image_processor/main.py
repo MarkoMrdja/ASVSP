@@ -2,9 +2,8 @@ import os
 import argparse
 import logging
 import time
-from pathlib import Path
-
-from data_loader import ImageLoader, ProcessingStatus, HDFSStatus, DatabaseManager
+from datetime import date
+from data_loader import ImageLoader, DatabaseManager
 from vehicle_detector import VehicleDetector
 
 
@@ -35,28 +34,247 @@ def parse_args():
                         help='HDFS namenode address')
     parser.add_argument('--max-file-size-mb', type=int, default=256,
                         help='Maximum size for parquet files in MB before finalizing')
-    parser.add_argument('--batches', type=int, default=3,
-                        help='Number of batches to process (-1 for unlimited)')
+    parser.add_argument('--max-days', type=int, default=-1,
+                        help='Maximum number of days to process (-1 for unlimited)')
     parser.add_argument('--max-workers', type=int, default=5,
                         help='Number of parallel workers for image downloads')
 
     parser.add_argument('--test-mode', action='store_true',
-                        help='Run in test mode (equivalent to --batches 2)')
+                        help='Run in test mode (process 2 days)')
 
     args = parser.parse_args()
 
     if args.test_mode:
-        args.batches = 2
+        args.max_days = 2
 
     return args
 
 
-def process_images(args, logger, db_manager: DatabaseManager):
-    """Process images from Azure blob storage using YOLO vehicle detection"""
+class ProcessingStats:
+    """Track processing metrics"""
+    def __init__(self):
+        self.days_completed = 0
+        self.days_failed = 0
+        self.total_batches = 0
+        self.total_images = 0
+        self.total_detections = 0
+        self.start_time = time.time()
+
+    def add_day_success(self, processing_date, batches, images, detections):
+        self.days_completed += 1
+        self.total_batches += batches
+        self.total_images += images
+        self.total_detections += detections
+
+    def add_day_failure(self, processing_date):
+        self.days_failed += 1
+
+
+def process_single_day(
+    processing_date: date,
+    loader: ImageLoader,
+    detector: VehicleDetector,
+    stats: ProcessingStats,
+    logger: logging.Logger
+):
+    """
+    Process a single day atomically with clear transaction boundaries.
+
+    Transaction flow:
+    1. BEGIN: Mark day IN_PROGRESS
+    2. PROCESS: All borders, all batches (detections accumulate in memory)
+    3. COMMIT: Write Parquet, upload HDFS, mark COMPLETED
+    4. ROLLBACK: On any error, clear buffer, mark FAILED
+    """
+    logger.info("=" * 70)
+    logger.info(f"PROCESSING DAY: {processing_date}")
+    logger.info("=" * 70)
+
+    # BEGIN TRANSACTION
+    loader.begin_day_transaction(processing_date)
+
+    day_start = time.time()
+    day_batches = 0
+    day_images = 0
+
+    try:
+        # Get all borders for this day
+        borders = loader.get_borders_for_day(processing_date)
+        logger.info(f"Found {len(borders)} border/direction combinations")
+
+        # Process each border/direction
+        for border, direction in borders:
+            logger.info(f"  Processing {border}/{direction}...")
+            border_batches = 0
+            border_images = 0
+
+            # Process all batches for this border/direction
+            while True:
+                batch = loader.get_next_batch_for_day(processing_date, border, direction)
+
+                if not batch:
+                    logger.info(f"    ✓ Completed {border}/{direction}: {border_batches} batches, {border_images} images")
+                    loader.mark_border_complete(processing_date, border, direction)
+                    break
+
+                # Download images with HDFS caching for retry resilience
+                images, paths, failed = loader.download_images_with_hdfs_cache(batch, processing_date)
+
+                if failed:
+                    logger.warning(f"    {len(failed)} images failed to download")
+
+                if not images:
+                    logger.error(f"    No images downloaded for batch, skipping")
+                    continue
+
+                # Detect vehicles (accumulates in detector.day_detections)
+                detections = detector.detect_vehicles(images, paths)
+
+                # Log batch to audit trail
+                loader.log_batch(
+                    processing_date, border, direction,
+                    batch_number=day_batches + 1,
+                    image_count=len(images),
+                    detection_count=len(detections),
+                    last_image_path=paths[-1]
+                )
+
+                day_batches += 1
+                day_images += len(images)
+                border_batches += 1
+                border_images += len(images)
+
+                logger.info(
+                    f"    Batch {day_batches}: {len(images)} images, {len(detections)} detections "
+                    f"(day total: {len(detector.day_detections)})"
+                )
+
+        # COMMIT TRANSACTION
+        day_detections = len(detector.day_detections)
+        logger.info(f"All borders complete. Finalizing day {processing_date}...")
+        hdfs_path = detector.finalize_day(processing_date, loader)
+
+        if not hdfs_path:
+            raise Exception("Failed to finalize day - no HDFS path returned")
+
+        day_duration = time.time() - day_start
+
+        logger.info("=" * 70)
+        logger.info(f"✓ DAY {processing_date} COMPLETED SUCCESSFULLY")
+        logger.info("=" * 70)
+        logger.info(f"  Duration: {day_duration:.2f}s")
+        logger.info(f"  Batches: {day_batches}")
+        logger.info(f"  Images: {day_images}")
+        logger.info(f"  Detections: {day_detections}")
+        logger.info(f"  HDFS: {hdfs_path}")
+        logger.info("=" * 70)
+
+        stats.add_day_success(processing_date, day_batches, day_images, day_detections)
+
+        # Cleanup HDFS image cache after successful completion
+        loader.cleanup_day_cache(processing_date)
+
+    except Exception as e:
+        logger.error("=" * 70)
+        logger.error(f"✗ DAY {processing_date} FAILED")
+        logger.error("=" * 70)
+        logger.error(f"  Error: {e}")
+        logger.error("=" * 70)
+
+        detector.rollback_day()
+        loader.mark_day_failed(processing_date, str(e))
+        raise
+
+
+def handle_day_failure(
+    processing_date: date,
+    loader: ImageLoader,
+    detector: VehicleDetector,
+    error_message: str,
+    logger: logging.Logger
+):
+    """
+    Handle day processing failure with exponential backoff retry.
+
+    Retry strategy:
+    - Attempt 1 (initial): Immediate (transient errors)
+    - Attempt 2: Wait 60s (temporary service issues)
+    - Attempt 3: Wait 300s (5 minutes, serious issues)
+    - After 3 failures: Mark PERMANENTLY_FAILED, skip to next day
+    """
+    retry_count = loader.get_day_retry_count(processing_date)
+
+    if retry_count < 3:
+        delays = [0, 60, 300]  # 0s, 1m, 5m
+        delay = delays[retry_count]
+
+        logger.warning("=" * 70)
+        logger.warning(f"DAY {processing_date} RETRY STRATEGY")
+        logger.warning("=" * 70)
+        logger.warning(f"  Attempt: {retry_count + 1}/3")
+        logger.warning(f"  Delay: {delay}s")
+        logger.warning(f"  Action: Retry entire day")
+        logger.warning("=" * 70)
+
+        if delay > 0:
+            logger.info(f"Waiting {delay}s before retry...")
+            time.sleep(delay)
+
+        loader.increment_day_retry(processing_date)
+        logger.info(f"Retry count incremented to {retry_count + 1}. Will retry on next iteration.")
+        logger.info(f"HDFS image cache preserved for retry")
+
+    else:
+        # Permanent failure - SKIP AND CONTINUE
+        logger.error("=" * 70)
+        logger.error(f"DAY {processing_date} PERMANENTLY FAILED")
+        logger.error("=" * 70)
+        logger.error(f"  Retries exhausted: 3/3")
+        logger.error(f"  Last error: {error_message}")
+        logger.error(f"  Action: Marking PERMANENTLY_FAILED and SKIPPING to next day")
+        logger.error("=" * 70)
+        logger.error(
+            f"NOTE: Day {processing_date} can be manually retried later by "
+            f"resetting status to PENDING in database."
+        )
+
+        loader.mark_day_permanently_failed(processing_date, error_message)
+
+        # Cleanup HDFS cache for permanent failure
+        loader.cleanup_day_cache(processing_date)
+
+
+def log_processing_summary(stats: ProcessingStats, logger: logging.Logger):
+    """Log final summary"""
+    duration = time.time() - stats.start_time
+    logger.info("=" * 70)
+    logger.info("PROCESSING SUMMARY")
+    logger.info("=" * 70)
+    logger.info(f"Duration: {duration / 60:.1f} minutes")
+    logger.info(f"Days completed: {stats.days_completed}")
+    logger.info(f"Days failed: {stats.days_failed}")
+    logger.info(f"Total batches: {stats.total_batches}")
+    logger.info(f"Total images: {stats.total_images}")
+    logger.info(f"Total detections: {stats.total_detections}")
+    if stats.days_completed > 0:
+        logger.info(f"Avg detections/day: {stats.total_detections / stats.days_completed:.0f}")
+    logger.info("=" * 70)
+
+
+def process_days(args, logger, db_manager: DatabaseManager):
+    """
+    Process images using day-first atomic strategy.
+
+    Each day is a transaction:
+    - All-or-nothing (no partial days in HDFS)
+    - Automatic retry on failure (up to 3 times)
+    - Skip to next day after permanent failure
+    """
     loader = ImageLoader(
         batch_size=args.batch_size,
         db_manager=db_manager,
-        max_workers=args.max_workers
+        max_workers=args.max_workers,
+        hdfs_namenode=args.hdfs_namenode
     )
     detector = VehicleDetector(
         model_path=args.model_path,
@@ -64,91 +282,31 @@ def process_images(args, logger, db_manager: DatabaseManager):
         max_file_size_mb=args.max_file_size_mb
     )
 
-    batch_count = 0
-    total_detections = 0
-    current_borders = set()
-    border_batch_counts = {}
-
-    logger.info("Beginning image processing...")
+    stats = ProcessingStats()
 
     try:
         while True:
-            if args.batches > 0 and batch_count >= args.batches:
-                logger.info(f"Processed requested {args.batches} batches. Exiting.")
+            # Check if we've reached the day limit
+            if args.max_days > 0 and stats.days_completed >= args.max_days:
+                logger.info(f"Reached maximum days limit ({args.max_days}). Stopping.")
                 break
 
-            batch = loader.get_next_batch()
+            # Get next day (prioritizes: failed > pending > discovery)
+            next_day = loader.get_next_day()
 
-            if not batch:
-                logger.info("No more batches to process. Exiting.")
+            if not next_day:
+                logger.info("No more days to process")
                 break
 
-            batch_count += 1
-
-            border = Path(batch[0]).parts[0]
-            current_borders.add(border)
-
-            if border not in border_batch_counts:
-                border_batch_counts[border] = 0
-            border_batch_counts[border] += 1
-
-            logger.info(f"Processing batch {batch_count} for border {border}: {len(batch)} images")
-
+            # Process entire day atomically
             try:
-                batch_start = time.time()
-
-                # Use parallel downloads
-                images, successful_paths, failed = loader.download_images_parallel(batch)
-
-                if failed:
-                    logger.warning(f"{len(failed)} images failed to download in batch {batch_count}")
-
-                if not images:
-                    logger.error(f"No images downloaded in batch {batch_count}, skipping")
-                    loader.set_batch_status(
-                        batch[-1],
-                        ProcessingStatus.FAILED,
-                        error_message="All downloads failed"
-                    )
-                    continue
-
-                # Process successfully downloaded images
-                detections = detector.detect_vehicles(images, successful_paths)
-
-                loader.set_batch_status(batch[-1], ProcessingStatus.COMPLETED)
-
-                batch_end = time.time()
-
-                total_detections += len(detections)
-                logger.info(f"Batch {batch_count} completed in {batch_end - batch_start:.2f} seconds")
-                logger.info(f"Downloaded {len(images)}/{len(batch)} images, detected {len(detections)} vehicles")
-
-                # Log current day detection count
-                day_count = detector.get_detection_count()
-                logger.info(f"Current day detection count: {day_count}")
-
+                process_single_day(next_day, loader, detector, stats, logger)
             except Exception as e:
-                logger.error(f"Error processing batch: {e}", exc_info=True)
-                loader.set_batch_status(
-                    batch[-1],
-                    ProcessingStatus.FAILED,
-                    error_message=str(e)
-                )
+                logger.error(f"Error processing day {next_day}: {e}", exc_info=True)
+                handle_day_failure(next_day, loader, detector, str(e), logger)
 
     finally:
-        # Ensure we finalize all files even if processing is interrupted
-        logger.info("Finalizing all remaining parquet files...")
-        saved_paths = detector.finalize_all(loader)
-
-        for day, hdfs_path in saved_paths.items():
-            logger.info(f"Finalized parquet file for day {day}: {hdfs_path}")
-
-        logger.info(f"Processing completed:")
-        logger.info(f"  Total batches: {batch_count}")
-        logger.info(f"  Total detections: {total_detections}")
-        logger.info(f"  Borders processed: {', '.join(current_borders)}")
-        for border, count in border_batch_counts.items():
-            logger.info(f"  Border {border}: {count} batches")
+        log_processing_summary(stats, logger)
 
 
 if __name__ == "__main__":
@@ -157,9 +315,9 @@ if __name__ == "__main__":
 
     logger.info(f"Starting vehicle detection service:")
     logger.info(f"  Batch size: {args.batch_size}")
+    logger.info(f"  Max days: {args.max_days if args.max_days > 0 else 'unlimited'}")
     logger.info(f"  Model path: {args.model_path}")
     logger.info(f"  HDFS namenode: {args.hdfs_namenode}")
-    logger.info(f"  HDFS directory: {args.hdfs_dir}")
     logger.info(f"  Max file size: {args.max_file_size_mb} MB")
     logger.info(f"  Max workers: {args.max_workers}")
 
@@ -167,7 +325,7 @@ if __name__ == "__main__":
     db_manager = DatabaseManager()
 
     try:
-        process_images(args, logger, db_manager)
+        process_days(args, logger, db_manager)
     finally:
         db_manager.close()
         logger.info("Database connections closed")

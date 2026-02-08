@@ -1,29 +1,29 @@
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, date
+from dataclasses import dataclass
+from datetime import datetime, date
 from typing import List, Optional, Tuple, Dict, Callable
 from azure.storage.blob import BlobServiceClient
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import psycopg2
 from psycopg2 import pool
-import itertools
 import logging
 from dotenv import load_dotenv
-from enum import Enum
 import numpy as np
 import cv2
 import os
 import time
 import functools
+import json
+from collections import defaultdict
+from hdfs import InsecureClient
 
 # =============================================================================
 # CONSTANTS - Known borders and directions for Serbian border crossings
 # =============================================================================
 
 KNOWN_BORDERS = [
-    "BATROVCI", "DJALA", "GOSTUN", "GRADINA", "HORGOS", "JABUKA",
-    "KELEBIJA", "KOTROMAN", "MZVORNIK", "PRESEVO", "RACA", "SID",
-    "SPILJANI", "TRBUSNICA", "VATIN", "VRSKA-CUKA"
+    "BATROVCI", "DJALA", "GRADINA", "HORGOS",
+    "KELEBIJA", "KOTROMAN", "RACA", "SID",
+    "SPILJANI", "VRSKA-CUKA"
 ]
 
 KNOWN_DIRECTIONS = ["I", "U"]  # I=izlaz/exit, U=ulaz/entrance
@@ -75,58 +75,6 @@ def retry_with_backoff(config: Optional[RetryConfig] = None):
 
 
 # =============================================================================
-# ENUMS AND DATA CLASSES
-# =============================================================================
-
-class ProcessingStatus(Enum):
-    IN_PROGRESS = "IN_PROGRESS"
-    COMPLETED = "COMPLETED"
-    FAILED = "FAILED"
-
-
-class HDFSStatus(Enum):
-    """Status of batch with respect to HDFS saving"""
-    PENDING = "PENDING"
-    SAVED = "SAVED"
-    FAILED = "FAILED"
-
-
-class DayProgressStatus(Enum):
-    """Status of border/direction processing for a specific day"""
-    PENDING = "PENDING"
-    IN_PROGRESS = "IN_PROGRESS"
-    COMPLETED = "COMPLETED"
-    SKIPPED = "SKIPPED"  # No data available for this border/direction/day
-
-
-@dataclass
-class ImageBatchMetadata:
-    """Metadata about a processed image batch"""
-    last_image_path: str
-    batch_size: int
-    status: ProcessingStatus
-    hdfs_status: HDFSStatus
-    start_time: datetime
-    end_time: Optional[datetime]
-    border: Optional[str] = None
-    hdfs_path: Optional[str] = None
-    retry_count: int = 0
-    error_message: Optional[str] = None
-
-    @property
-    def path_parts(self) -> Tuple[str, str, int, int, int]:
-        """Returns (border, direction, year, month, day) from path"""
-        parts = Path(self.last_image_path).parts
-        return (
-            parts[0],  # border
-            parts[1],  # direction
-            int(parts[2]),  # year
-            int(parts[3]),  # month
-            int(parts[4])   # day
-        )
-
-
-# =============================================================================
 # DATABASE MANAGER
 # =============================================================================
 
@@ -156,7 +104,7 @@ class DatabaseManager:
 
         self.host = host or os.environ.get("POSTGRES_HOST", "hive-metastore-postgresql")
         self.port = port or int(os.environ.get("POSTGRES_PORT", "5432"))
-        self.database = database or os.environ.get("POSTGRES_DB", "metastore")
+        self.database = database or os.environ.get("POSTGRES_DB", "hive")
         self.user = user or os.environ.get("POSTGRES_USER", "hive")
         self.password = password or os.environ.get("POSTGRES_PASSWORD", "hive")
 
@@ -174,81 +122,100 @@ class DatabaseManager:
         logging.info(f"Connected to PostgreSQL at {self.host}:{self.port}/{self.database}")
 
     def _init_schema(self):
-        """Initialize database schema with migration support"""
+        """Initialize database schema with new day-level atomic writes architecture"""
         with self.get_connection() as conn:
             with conn.cursor() as cur:
+                # Create schema
                 cur.execute("CREATE SCHEMA IF NOT EXISTS image_processor")
 
-                # Create batch_tracking table
+                # Create day_processing table (primary transaction table)
                 cur.execute("""
-                    CREATE TABLE IF NOT EXISTS image_processor.batch_tracking (
+                    CREATE TABLE IF NOT EXISTS image_processor.day_processing (
+                        -- Identity
                         id SERIAL PRIMARY KEY,
-                        last_image_path TEXT NOT NULL,
-                        batch_size INTEGER NOT NULL,
-                        status VARCHAR(20) NOT NULL DEFAULT 'IN_PROGRESS',
-                        hdfs_status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
-                        start_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        end_time TIMESTAMPTZ,
-                        border VARCHAR(100),
-                        processing_date DATE,
-                        hdfs_path TEXT,
+                        processing_date DATE NOT NULL UNIQUE,
+
+                        -- Transaction status
+                        status VARCHAR(30) NOT NULL,
                         retry_count INTEGER NOT NULL DEFAULT 0,
+
+                        -- Progress tracking (updated as day processes)
+                        borders_completed JSONB NOT NULL DEFAULT '[]',
+                        total_batches INTEGER DEFAULT 0,
+                        total_images INTEGER DEFAULT 0,
+                        total_detections INTEGER DEFAULT 0,
+
+                        -- Discovery metadata
+                        available_borders JSONB NOT NULL DEFAULT '[]',
+
+                        -- HDFS results (set on completion)
+                        hdfs_path TEXT,
+                        file_size_bytes BIGINT,
+
+                        -- Error handling
                         error_message TEXT,
+                        last_error_time TIMESTAMPTZ,
+
+                        -- Timestamps
+                        started_at TIMESTAMPTZ,
+                        completed_at TIMESTAMPTZ,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-                        CONSTRAINT chk_status CHECK (status IN ('IN_PROGRESS', 'COMPLETED', 'FAILED')),
-                        CONSTRAINT chk_hdfs_status CHECK (hdfs_status IN ('PENDING', 'SAVED', 'FAILED'))
+                        CONSTRAINT chk_status CHECK (status IN (
+                            'PENDING', 'IN_PROGRESS', 'COMPLETED', 'FAILED', 'PERMANENTLY_FAILED'
+                        ))
                     )
                 """)
 
-                # Create indexes
+                # Create indexes for day_processing
                 cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_batch_status
-                    ON image_processor.batch_tracking(status)
+                    CREATE INDEX IF NOT EXISTS idx_day_processing_date
+                    ON image_processor.day_processing(processing_date)
                 """)
                 cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_batch_hdfs_status
-                    ON image_processor.batch_tracking(hdfs_status)
+                    CREATE INDEX IF NOT EXISTS idx_day_processing_status
+                    ON image_processor.day_processing(status)
                 """)
                 cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_batch_start_time
-                    ON image_processor.batch_tracking(start_time DESC)
-                """)
-                cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_batch_processing_date
-                    ON image_processor.batch_tracking(processing_date)
+                    CREATE INDEX IF NOT EXISTS idx_day_processing_date_status
+                    ON image_processor.day_processing(processing_date, status)
                 """)
 
-                # Create day_progress table
+                # Create batch_log table (audit trail + within-day resume)
                 cur.execute("""
-                    CREATE TABLE IF NOT EXISTS image_processor.day_progress (
+                    CREATE TABLE IF NOT EXISTS image_processor.batch_log (
                         id SERIAL PRIMARY KEY,
                         processing_date DATE NOT NULL,
                         border VARCHAR(100) NOT NULL,
                         direction VARCHAR(10) NOT NULL,
-                        status VARCHAR(20) NOT NULL,
-                        last_image_path TEXT,
-                        batch_count INTEGER DEFAULT 0,
-                        image_count INTEGER DEFAULT 0,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        batch_number INTEGER NOT NULL,
 
-                        UNIQUE(processing_date, border, direction),
-                        CONSTRAINT chk_day_status CHECK (status IN ('PENDING', 'IN_PROGRESS', 'COMPLETED', 'SKIPPED'))
+                        -- Batch metrics
+                        image_count INTEGER NOT NULL,
+                        detection_count INTEGER NOT NULL,
+                        last_image_path TEXT NOT NULL,
+
+                        -- Timing
+                        started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        completed_at TIMESTAMPTZ,
+                        duration_seconds NUMERIC(10, 2),
+
+                        -- Foreign key to day
+                        day_processing_id INTEGER REFERENCES image_processor.day_processing(id) ON DELETE CASCADE,
+
+                        CONSTRAINT unique_batch UNIQUE(processing_date, border, direction, batch_number)
                     )
                 """)
+
+                # Create indexes for batch_log
                 cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_day_progress_date
-                    ON image_processor.day_progress(processing_date)
+                    CREATE INDEX IF NOT EXISTS idx_batch_log_date
+                    ON image_processor.batch_log(processing_date)
                 """)
                 cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_day_progress_status
-                    ON image_processor.day_progress(status)
-                """)
-                cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_day_progress_date_status
-                    ON image_processor.day_progress(processing_date, status)
+                    CREATE INDEX IF NOT EXISTS idx_batch_log_day_id
+                    ON image_processor.batch_log(day_processing_id)
                 """)
 
                 # Create trigger function for auto-updating updated_at
@@ -262,14 +229,14 @@ class DatabaseManager:
                     $$ LANGUAGE plpgsql
                 """)
 
-                # Create trigger on day_progress (use PROCEDURE for older PostgreSQL versions)
+                # Create trigger on day_processing
                 cur.execute("""
-                    DROP TRIGGER IF EXISTS update_day_progress_updated_at
-                    ON image_processor.day_progress
+                    DROP TRIGGER IF EXISTS update_day_processing_updated_at
+                    ON image_processor.day_processing
                 """)
                 cur.execute("""
-                    CREATE TRIGGER update_day_progress_updated_at
-                        BEFORE UPDATE ON image_processor.day_progress
+                    CREATE TRIGGER update_day_processing_updated_at
+                        BEFORE UPDATE ON image_processor.day_processing
                         FOR EACH ROW
                         EXECUTE PROCEDURE image_processor.update_updated_at_column()
                 """)
@@ -319,7 +286,8 @@ class ImageLoader:
         batch_size: int = 20,
         db_manager: Optional[DatabaseManager] = None,
         max_workers: int = 5,
-        retry_config: Optional[RetryConfig] = None
+        retry_config: Optional[RetryConfig] = None,
+        hdfs_namenode: str = "http://namenode:9870"
     ):
         load_dotenv()
 
@@ -333,60 +301,14 @@ class ImageLoader:
         self.max_workers = max_workers
         self.retry_config = retry_config or RetryConfig()
 
+        # Initialize HDFS client for image caching
+        self.hdfs_client = InsecureClient(hdfs_namenode, user="root")
+
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s'
         )
         self.logger = logging.getLogger(__name__)
-
-    def _get_last_processed_batch(self) -> Optional[ImageBatchMetadata]:
-        """Get the last processed batch from database"""
-        with self.db_manager.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT last_image_path, batch_size, status, hdfs_status,
-                           start_time, end_time, border, hdfs_path, retry_count, error_message
-                    FROM image_processor.batch_tracking
-                    ORDER BY start_time DESC LIMIT 1
-                """)
-                row = cur.fetchone()
-
-                if row:
-                    return ImageBatchMetadata(
-                        last_image_path=row[0],
-                        batch_size=row[1],
-                        status=ProcessingStatus(row[2]),
-                        hdfs_status=HDFSStatus(row[3]),
-                        start_time=row[4],
-                        end_time=row[5],
-                        border=row[6],
-                        hdfs_path=row[7],
-                        retry_count=row[8],
-                        error_message=row[9]
-                    )
-        return None
-
-    def _record_batch_start(self, last_image_path: str, border: str, processing_date: Optional[date] = None) -> int:
-        """Record the start of batch processing"""
-        with self.db_manager.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO image_processor.batch_tracking
-                    (last_image_path, batch_size, status, hdfs_status, start_time, border, processing_date)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                """, (
-                    last_image_path,
-                    self.batch_size,
-                    ProcessingStatus.IN_PROGRESS.value,
-                    HDFSStatus.PENDING.value,
-                    datetime.now(),
-                    border,
-                    processing_date
-                ))
-                batch_id = cur.fetchone()[0]
-                conn.commit()
-                return batch_id
 
     def _list_blobs_after(self, prefix: str, start_after: Optional[str] = None) -> List[str]:
         """List blobs after a certain path"""
@@ -399,637 +321,469 @@ class ImageLoader:
                 break
         return blobs
 
-    def _get_next_path_for_border_direction(
+    # =============================================================================
+    # DAY-LEVEL DISCOVERY METHODS (93% API Call Reduction)
+    # =============================================================================
+
+    def discover_days_in_month(
         self,
         border: str,
         direction: str,
         year: int,
-        month: int,
-        day: int
-    ) -> Optional[str]:
-        """Get next valid path within a border/direction"""
-        today = datetime.now().date()
-        current = datetime(year, month, day).date()
-
-        # Try next day
-        next_day = current + timedelta(days=1)
-        if next_day < today:
-            prefix = f"{border}/{direction}/{next_day.year}/{next_day.month}/{next_day.day}/"
-            blobs = list(itertools.islice(
-                self.container_client.list_blobs(name_starts_with=prefix), 1
-            ))
-            if blobs:
-                return prefix
-
-        # Try next month
-        if month < 12:
-            prefix = f"{border}/{direction}/{year}/{month+1}/"
-            blobs = list(itertools.islice(
-                self.container_client.list_blobs(name_starts_with=prefix), 1
-            ))
-            if blobs:
-                return prefix
-
-        # Try next year
-        prefix = f"{border}/{direction}/{year+1}/"
-        blobs = list(itertools.islice(
-            self.container_client.list_blobs(name_starts_with=prefix), 1
-        ))
-        if blobs:
-            return prefix
-
-        return None
-
-    def _get_next_path(
-        self,
-        border: str,
-        direction: str,
-        year: int,
-        month: int,
-        day: int
-    ) -> Optional[str]:
-        """Get next valid path to check for images using configured borders/directions"""
-        # First, try to continue within the same border/direction
-        next_in_current = self._get_next_path_for_border_direction(
-            border, direction, year, month, day
-        )
-        if next_in_current:
-            return next_in_current
-
-        # Try next direction in the same border
-        try:
-            dir_idx = KNOWN_DIRECTIONS.index(direction)
-            if dir_idx < len(KNOWN_DIRECTIONS) - 1:
-                next_direction = KNOWN_DIRECTIONS[dir_idx + 1]
-                prefix = f"{border}/{next_direction}/"
-                blobs = list(itertools.islice(
-                    self.container_client.list_blobs(name_starts_with=prefix), 1
-                ))
-                if blobs:
-                    return prefix
-        except ValueError:
-            pass
-
-        # Try next border
-        try:
-            border_idx = KNOWN_BORDERS.index(border)
-            for next_border in KNOWN_BORDERS[border_idx + 1:]:
-                for next_direction in KNOWN_DIRECTIONS:
-                    prefix = f"{next_border}/{next_direction}/"
-                    blobs = list(itertools.islice(
-                        self.container_client.list_blobs(name_starts_with=prefix), 1
-                    ))
-                    if blobs:
-                        return prefix
-        except ValueError:
-            pass
-
-        return None
-
-    def get_all_borders(self) -> List[str]:
-        """Get all known border names (from configuration, no API call)"""
-        return KNOWN_BORDERS.copy()
-
-    def _find_starting_point(self) -> Optional[str]:
-        """Find earliest data by probing configured borders (no full listing)"""
-        self.logger.info("Finding starting point by probing configured borders...")
-
-        for border in KNOWN_BORDERS:
-            for direction in KNOWN_DIRECTIONS:
-                # Probe years from 2020 onwards
-                for year in range(2020, datetime.now().year + 1):
-                    prefix = f"{border}/{direction}/{year}/"
-                    # Only fetch 1 blob to check existence
-                    blobs = list(itertools.islice(
-                        self.container_client.list_blobs(name_starts_with=prefix), 1
-                    ))
-                    if blobs:
-                        # Found data, drill down to find first day
-                        self.logger.info(f"Found data at {prefix}, drilling down...")
-                        first_path = self._find_first_day(border, direction, year)
-                        if first_path:
-                            return first_path
-        return None
-
-    def _find_first_day(self, border: str, direction: str, year: int) -> Optional[str]:
-        """Find first day with data in a year"""
-        for month in range(1, 13):
-            for day in range(1, 32):
-                try:
-                    # Validate date
-                    datetime(year, month, day)
-                    prefix = f"{border}/{direction}/{year}/{month}/{day}/"
-                    blobs = list(itertools.islice(
-                        self.container_client.list_blobs(name_starts_with=prefix), 1
-                    ))
-                    if blobs:
-                        return prefix
-                except ValueError:
-                    # Invalid date (e.g., Feb 30)
-                    continue
-        return f"{border}/{direction}/{year}/"
-
-    # =============================================================================
-    # DAY-FIRST PROCESSING METHODS
-    # =============================================================================
-
-    def _probe_border_for_day(self, border: str, direction: str, target_date: date) -> Optional[str]:
+        month: int
+    ) -> List[int]:
         """
-        Check if a border/direction has data for a specific day.
+        Discover all days with data for border/direction/month using walk_blobs.
+
+        Uses Azure's delimiter='/' feature to list "virtual directories" efficiently.
 
         Args:
             border: Border name
             direction: Direction (I or U)
-            target_date: Date to check
+            year: Year
+            month: Month (1-12)
 
         Returns:
-            Prefix path if data exists, None otherwise
-        """
-        prefix = f"{border}/{direction}/{target_date.year}/{target_date.month}/{target_date.day}/"
-        blobs = list(itertools.islice(
-            self.container_client.list_blobs(name_starts_with=prefix), 1
-        ))
-        return prefix if blobs else None
+            List of day numbers (1-31) with data
 
-    def _probe_all_borders_parallel(self, target_date: date) -> List[Tuple[str, str, str]]:
+        API calls: 1 per border/direction/month
         """
-        Probe all borders in parallel to find which have data for a specific day.
+        prefix = f"{border}/{direction}/{year}/{month}/"
+        days = []
+
+        try:
+            for item in self.container_client.walk_blobs(
+                name_starts_with=prefix,
+                delimiter='/'
+            ):
+                if hasattr(item, 'name'):  # BlobPrefix (virtual directory)
+                    day_str = item.name.rstrip('/').split('/')[-1]
+                    try:
+                        day = int(day_str)
+                        if 1 <= day <= 31:
+                            days.append(day)
+                    except ValueError:
+                        continue
+        except Exception as e:
+            self.logger.warning(f"Error discovering days for {prefix}: {e}")
+
+        return sorted(days)
+
+    def _discover_month_parallel(
+        self,
+        year: int,
+        month: int
+    ) -> Dict[int, List[Tuple[str, str]]]:
+        """
+        Discover all days in a month across all borders in parallel.
 
         Args:
-            target_date: Date to check
+            year: Year
+            month: Month (1-12)
 
         Returns:
-            List of (border, direction, prefix) tuples with data
+            Dict mapping day number to list of (border, direction) tuples
+            Example: {15: [("HORGOS", "I"), ("HORGOS", "U")], 16: [...]}
+
+        API calls: 20 (10 borders x 2 directions)
         """
-        results = []
-        with ThreadPoolExecutor(max_workers=16) as executor:
+        day_data = defaultdict(list)
+
+        with ThreadPoolExecutor(max_workers=20) as executor:
             futures = {}
+
             for border in KNOWN_BORDERS:
                 for direction in KNOWN_DIRECTIONS:
-                    future = executor.submit(self._probe_border_for_day, border, direction, target_date)
+                    future = executor.submit(
+                        self.discover_days_in_month,
+                        border, direction, year, month
+                    )
                     futures[future] = (border, direction)
 
             for future in as_completed(futures):
                 border, direction = futures[future]
                 try:
-                    prefix = future.result()
-                    if prefix:
-                        results.append((border, direction, prefix))
+                    days = future.result()
+                    for day in days:
+                        day_data[day].append((border, direction))
                 except Exception as e:
-                    self.logger.warning(f"Error probing {border}/{direction} for {target_date}: {e}")
+                    self.logger.warning(f"Error discovering {border}/{direction} for {year}-{month}: {e}")
+
+        return day_data
+
+    def discover_next_days_batch(
+        self,
+        start_date: date,
+        max_days: int = 30
+    ) -> List[Tuple[date, List[Tuple[str, str]]]]:
+        """
+        Discover next batch of days with data, starting from start_date.
+
+        Processes month by month using walk_blobs() for efficiency.
+
+        Args:
+            start_date: Date to start searching from (exclusive)
+            max_days: Maximum days to discover
+
+        Returns:
+            List of (date, [(border, direction), ...]) tuples
+
+        API calls: ~20 per month (10 borders x 2 directions)
+        """
+        results = []
+        current = start_date
+        today = datetime.now().date()
+
+        while len(results) < max_days and current < today:
+            year, month = current.year, current.month
+
+            self.logger.debug(f"Discovering days in {year}-{month:02d}...")
+
+            # Discover all days in this month (20 API calls)
+            month_data = self._discover_month_parallel(year, month)
+
+            # Filter to dates >= current and < today
+            for day, borders in sorted(month_data.items()):
+                try:
+                    check_date = date(year, month, day)
+                except ValueError:
+                    continue
+
+                if check_date >= current and check_date < today:
+                    results.append((check_date, borders))
+                    if len(results) >= max_days:
+                        break
+
+            # Move to next month
+            if month == 12:
+                current = date(year + 1, 1, 1)
+            else:
+                current = date(year, month + 1, 1)
 
         return results
 
-    def _get_current_processing_day(self) -> Optional[date]:
-        """
-        Get the current day being processed.
-
-        Returns:
-            Date if there's a day in progress/pending, None otherwise
-        """
+    def _get_last_processed_date(self) -> Optional[date]:
+        """Get the last processed date from database"""
         with self.db_manager.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT DISTINCT processing_date
-                    FROM image_processor.day_progress
-                    WHERE status IN (%s, %s)
-                    ORDER BY processing_date
+                    SELECT processing_date
+                    FROM image_processor.day_processing
+                    ORDER BY processing_date DESC
                     LIMIT 1
-                """, (DayProgressStatus.PENDING.value, DayProgressStatus.IN_PROGRESS.value))
+                """)
                 row = cur.fetchone()
                 return row[0] if row else None
 
-    def _initialize_day(self, processing_date: date) -> int:
-        """
-        Initialize day processing by probing all borders in parallel.
+    # =============================================================================
+    # DAY-LEVEL TRANSACTION MANAGEMENT
+    # =============================================================================
 
-        Args:
-            processing_date: Date to initialize
+    def get_next_day(self) -> Optional[date]:
+        """
+        Get next day to process with intelligent prioritization.
+
+        Priority order:
+        1. FAILED days (retry before discovering new days)
+        2. PENDING days (from previous discovery batch)
+        3. Discover new days (if no pending/failed)
 
         Returns:
-            Count of borders with data
-        """
-        self.logger.info(f"Initializing day {processing_date} - probing all borders in parallel...")
-
-        # Probe all borders in parallel
-        borders_with_data = self._probe_all_borders_parallel(processing_date)
-
-        self.logger.info(f"Found {len(borders_with_data)} border/direction combinations with data for {processing_date}")
-
-        # Create day_progress entries
-        with self.db_manager.get_connection() as conn:
-            with conn.cursor() as cur:
-                borders_with_data_set = {(b, d) for b, d, _ in borders_with_data}
-
-                # Insert entries for borders with data (PENDING)
-                for border, direction, prefix in borders_with_data:
-                    cur.execute("""
-                        INSERT INTO image_processor.day_progress
-                        (processing_date, border, direction, status)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (processing_date, border, direction) DO NOTHING
-                    """, (processing_date, border, direction, DayProgressStatus.PENDING.value))
-
-                # Insert entries for borders without data (SKIPPED) for audit trail
-                for border in KNOWN_BORDERS:
-                    for direction in KNOWN_DIRECTIONS:
-                        if (border, direction) not in borders_with_data_set:
-                            cur.execute("""
-                                INSERT INTO image_processor.day_progress
-                                (processing_date, border, direction, status)
-                                VALUES (%s, %s, %s, %s)
-                                ON CONFLICT (processing_date, border, direction) DO NOTHING
-                            """, (processing_date, border, direction, DayProgressStatus.SKIPPED.value))
-
-                conn.commit()
-
-        return len(borders_with_data)
-
-    def _get_next_border_for_day(self, processing_date: date) -> Optional[Tuple[str, str]]:
-        """
-        Get the next border/direction to process for a specific day.
-
-        Args:
-            processing_date: Date to get next border for
-
-        Returns:
-            (border, direction) tuple or None if all complete
+            Next date to process or None if exhausted
         """
         with self.db_manager.get_connection() as conn:
             with conn.cursor() as cur:
+                # Priority 1: Check for failed days (retry)
                 cur.execute("""
-                    SELECT border, direction
-                    FROM image_processor.day_progress
-                    WHERE processing_date = %s AND status IN (%s, %s)
-                    ORDER BY border, direction
+                    SELECT processing_date, retry_count
+                    FROM image_processor.day_processing
+                    WHERE status = 'FAILED' AND retry_count < 3
+                    ORDER BY processing_date
                     LIMIT 1
-                """, (processing_date, DayProgressStatus.PENDING.value, DayProgressStatus.IN_PROGRESS.value))
+                """)
                 row = cur.fetchone()
-                return (row[0], row[1]) if row else None
+                if row:
+                    self.logger.info(f"Found failed day for retry: {row[0]} (attempt {row[1] + 1}/3)")
+                    return row[0]
 
-    def _discover_next_day_with_data(self, after_date: date) -> Optional[date]:
+                # Priority 2: Check for pending days
+                cur.execute("""
+                    SELECT processing_date
+                    FROM image_processor.day_processing
+                    WHERE status = 'PENDING'
+                    ORDER BY processing_date
+                    LIMIT 1
+                """)
+                row = cur.fetchone()
+                if row:
+                    self.logger.info(f"Found pending day: {row[0]}")
+                    return row[0]
+
+        # Priority 3: Discover new days
+        return self._discover_and_initialize_next_day()
+
+    def _discover_and_initialize_next_day(self) -> Optional[date]:
         """
-        Find the next day with data after a given date by probing in parallel.
-
-        Args:
-            after_date: Date to search after
-
-        Returns:
-            Next date with data or None
+        Discover next batch of days and initialize them in database.
         """
-        today = datetime.now().date()
-        current_date = after_date + timedelta(days=1)
+        last_date = self._get_last_processed_date()
 
-        # Check up to 30 days ahead at a time for efficiency
-        while current_date < today:
-            self.logger.info(f"Searching for next day with data starting from {current_date}...")
+        if last_date is None:
+            last_date = date(2020, 1, 1)
+            self.logger.info(f"Cold start - searching from {last_date}")
 
-            # Check multiple days in parallel (up to 30 days)
-            dates_to_check = []
-            for i in range(30):
-                check_date = current_date + timedelta(days=i)
-                if check_date >= today:
-                    break
-                dates_to_check.append(check_date)
+        self.logger.info("Discovering next batch of days...")
+        days_batch = self.discover_next_days_batch(start_date=last_date, max_days=30)
 
-            # Probe each date
-            for check_date in dates_to_check:
-                borders_with_data = self._probe_all_borders_parallel(check_date)
-                if borders_with_data:
-                    self.logger.info(f"Found next day with data: {check_date}")
-                    return check_date
+        if not days_batch:
+            self.logger.info("No more days discovered")
+            return None
 
-            current_date += timedelta(days=30)
+        self.logger.info(f"Discovered {len(days_batch)} days with data")
 
-        self.logger.info("No more days with data found")
-        return None
-
-    def _update_day_progress(
-        self,
-        processing_date: date,
-        border: str,
-        direction: str,
-        status: DayProgressStatus,
-        last_image_path: Optional[str] = None,
-        increment_batch: bool = False,
-        image_count: int = 0
-    ):
-        """
-        Update day_progress entry.
-
-        Args:
-            processing_date: Date being processed
-            border: Border name
-            direction: Direction
-            status: New status
-            last_image_path: Last processed image path
-            increment_batch: Whether to increment batch_count
-            image_count: Number of images processed (to add to total)
-        """
+        # Initialize all discovered days in database
         with self.db_manager.get_connection() as conn:
             with conn.cursor() as cur:
-                if increment_batch:
+                for processing_date, borders in days_batch:
+                    borders_json = json.dumps([f"{b}/{d}" for b, d in borders])
                     cur.execute("""
-                        UPDATE image_processor.day_progress
-                        SET status = %s, last_image_path = %s,
-                            batch_count = batch_count + 1,
-                            image_count = image_count + %s
-                        WHERE processing_date = %s AND border = %s AND direction = %s
-                    """, (status.value, last_image_path, image_count, processing_date, border, direction))
-                elif last_image_path:
-                    cur.execute("""
-                        UPDATE image_processor.day_progress
-                        SET status = %s, last_image_path = %s
-                        WHERE processing_date = %s AND border = %s AND direction = %s
-                    """, (status.value, last_image_path, processing_date, border, direction))
-                else:
-                    cur.execute("""
-                        UPDATE image_processor.day_progress
-                        SET status = %s
-                        WHERE processing_date = %s AND border = %s AND direction = %s
-                    """, (status.value, processing_date, border, direction))
+                        INSERT INTO image_processor.day_processing
+                        (processing_date, status, available_borders)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (processing_date) DO NOTHING
+                    """, (processing_date, 'PENDING', borders_json))
                 conn.commit()
 
-    def _mark_day_complete(self, processing_date: date):
-        """
-        Mark a day as complete by ensuring all borders are COMPLETED or SKIPPED.
+        return days_batch[0][0]
 
-        Args:
-            processing_date: Date to mark complete
-        """
-        with self.db_manager.get_connection() as conn:
-            with conn.cursor() as cur:
-                # Check if all borders are done
-                cur.execute("""
-                    SELECT COUNT(*)
-                    FROM image_processor.day_progress
-                    WHERE processing_date = %s AND status IN (%s, %s)
-                """, (processing_date, DayProgressStatus.PENDING.value, DayProgressStatus.IN_PROGRESS.value))
-
-                pending_count = cur.fetchone()[0]
-
-                if pending_count == 0:
-                    self.logger.info(f"Day {processing_date} is complete")
-                    return True
-
-                return False
-
-    def get_next_batch(self) -> Optional[List[str]]:
-        """
-        Get next batch of images to process using day-first strategy.
-        Processes ALL borders for Day N before moving to Day N+1.
-        """
-        today = datetime.now().date()
-
-        # Step 1: Get current processing day
-        current_day = self._get_current_processing_day()
-
-        if not current_day:
-            # No day in progress - find or initialize next day
-            last_batch = self._get_last_processed_batch()
-
-            if last_batch and last_batch.last_image_path:
-                # Resume from last processed image's date
-                last_date = self._get_image_date(last_batch.last_image_path)
-                next_day = self._discover_next_day_with_data(last_date)
-            else:
-                # Cold start - find first available day
-                self.logger.info("Cold start - searching for first day with data...")
-                # Start from a reasonable date (e.g., 2020-01-01)
-                start_date = date(2020, 1, 1)
-                next_day = self._discover_next_day_with_data(start_date - timedelta(days=1))
-
-            if not next_day or next_day >= today:
-                self.logger.info("No more days to process")
-                return None
-
-            # Initialize the day
-            border_count = self._initialize_day(next_day)
-            if border_count == 0:
-                self.logger.warning(f"No borders with data for {next_day}")
-                return None
-
-            current_day = next_day
-
-        # Step 2: Get next border/direction for this day
-        border_direction = self._get_next_border_for_day(current_day)
-
-        if not border_direction:
-            # All borders for this day are complete
-            self._mark_day_complete(current_day)
-            self.logger.info(f"Completed all borders for {current_day}, moving to next day")
-            # Recursively get next batch from next day
-            return self.get_next_batch()
-
-        border, direction = border_direction
-
-        # Step 3: Fetch batch for this border/direction/day
-        prefix = f"{border}/{direction}/{current_day.year}/{current_day.month}/{current_day.day}/"
-
-        # Get last image path for this border/direction/day if resuming
+    def begin_day_transaction(self, processing_date: date):
+        """Mark day as IN_PROGRESS to begin transaction."""
         with self.db_manager.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT last_image_path, status
-                    FROM image_processor.day_progress
+                    UPDATE image_processor.day_processing
+                    SET status = 'IN_PROGRESS', started_at = NOW()
+                    WHERE processing_date = %s
+                """, (processing_date,))
+                conn.commit()
+        self.logger.info(f"BEGIN TRANSACTION: Day {processing_date}")
+
+    def get_borders_for_day(self, processing_date: date) -> List[Tuple[str, str]]:
+        """Get list of (border, direction) tuples for a day."""
+        with self.db_manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT available_borders
+                    FROM image_processor.day_processing
+                    WHERE processing_date = %s
+                """, (processing_date,))
+                row = cur.fetchone()
+
+                if not row or not row[0]:
+                    return []
+
+                # Parse JSONB: ["HORGOS/I", "HORGOS/U"] -> [("HORGOS", "I"), ("HORGOS", "U")]
+                borders = []
+                for item in row[0]:
+                    parts = item.split('/')
+                    if len(parts) == 2:
+                        borders.append((parts[0], parts[1]))
+                return borders
+
+    def get_next_batch_for_day(
+        self, processing_date: date, border: str, direction: str
+    ) -> Optional[List[str]]:
+        """
+        Get next batch for day/border/direction.
+        Uses batch_log for within-day resume.
+        """
+        # Get last processed image from batch_log
+        with self.db_manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT last_image_path
+                    FROM image_processor.batch_log
                     WHERE processing_date = %s AND border = %s AND direction = %s
-                """, (current_day, border, direction))
+                    ORDER BY batch_number DESC
+                    LIMIT 1
+                """, (processing_date, border, direction))
                 row = cur.fetchone()
                 last_image_path = row[0] if row else None
-                current_status = row[1] if row else None
 
-        # List blobs after last processed image
+        prefix = f"{border}/{direction}/{processing_date.year}/{processing_date.month}/{processing_date.day}/"
         images = self._list_blobs_after(prefix, last_image_path)
+        return images if images else None
 
-        if not images:
-            # No more images for this border/direction/day - mark as complete
-            self.logger.info(f"Completed {border}/{direction} for {current_day}")
-            self._update_day_progress(
-                current_day, border, direction,
-                DayProgressStatus.COMPLETED
-            )
-            # Recursively get next batch (next border or next day)
-            return self.get_next_batch()
-
-        # Step 4: Update day_progress - mark as IN_PROGRESS
-        self._update_day_progress(
-            current_day, border, direction,
-            DayProgressStatus.IN_PROGRESS,
-            last_image_path=images[-1],
-            increment_batch=True,
-            image_count=len(images)
-        )
-
-        # Step 5: Record batch in batch_tracking
-        self._record_batch_start(images[-1], border, current_day)
-
-        self.logger.info(f"Fetched {len(images)} images from {border}/{direction} for {current_day}")
-
-        return images
-
-    def _get_image_date(self, image_path: str) -> datetime.date:
-        """Extract date from image path"""
-        parts = Path(image_path).parts
-        return datetime(
-            int(parts[2]),  # year
-            int(parts[3]),  # month
-            int(parts[4])   # day
-        ).date()
-
-    def set_batch_status(
-        self,
-        last_image_path: str,
-        status: ProcessingStatus,
-        error_message: Optional[str] = None
+    def log_batch(
+        self, processing_date: date, border: str, direction: str,
+        batch_number: int, image_count: int, detection_count: int, last_image_path: str
     ):
-        """Set status of batch in database"""
-        with self.db_manager.get_connection() as conn:
-            with conn.cursor() as cur:
-                if error_message:
-                    cur.execute("""
-                        UPDATE image_processor.batch_tracking
-                        SET status = %s, end_time = %s, error_message = %s,
-                            updated_at = NOW(), retry_count = retry_count + 1
-                        WHERE last_image_path = %s AND status = %s
-                    """, (
-                        status.value,
-                        datetime.now(),
-                        error_message,
-                        last_image_path,
-                        ProcessingStatus.IN_PROGRESS.value
-                    ))
-                else:
-                    cur.execute("""
-                        UPDATE image_processor.batch_tracking
-                        SET status = %s, end_time = %s, updated_at = NOW()
-                        WHERE last_image_path = %s AND status = %s
-                    """, (
-                        status.value,
-                        datetime.now(),
-                        last_image_path,
-                        ProcessingStatus.IN_PROGRESS.value
-                    ))
-                conn.commit()
-
-    def set_batch_hdfs_status(
-        self,
-        last_image_path: str,
-        hdfs_status: HDFSStatus,
-        hdfs_path: Optional[str] = None
-    ):
-        """Set HDFS status of batch in database"""
-        with self.db_manager.get_connection() as conn:
-            with conn.cursor() as cur:
-                if hdfs_path:
-                    cur.execute("""
-                        UPDATE image_processor.batch_tracking
-                        SET hdfs_status = %s, hdfs_path = %s, updated_at = NOW()
-                        WHERE last_image_path = %s
-                    """, (
-                        hdfs_status.value,
-                        hdfs_path,
-                        last_image_path
-                    ))
-                else:
-                    cur.execute("""
-                        UPDATE image_processor.batch_tracking
-                        SET hdfs_status = %s, updated_at = NOW()
-                        WHERE last_image_path = %s
-                    """, (
-                        hdfs_status.value,
-                        last_image_path
-                    ))
-                conn.commit()
-
-    def get_pending_hdfs_batches(self) -> Dict[str, List[str]]:
-        """
-        Get batches that have been processed but not saved to HDFS,
-        grouped by border
-
-        Returns:
-            Dictionary mapping border name to list of last_image_paths
-        """
+        """Log batch to audit trail for debugging and within-day resume."""
         with self.db_manager.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT last_image_path, border
-                    FROM image_processor.batch_tracking
-                    WHERE status = %s AND hdfs_status = %s
-                    ORDER BY start_time
-                """, (
-                    ProcessingStatus.COMPLETED.value,
-                    HDFSStatus.PENDING.value
-                ))
+                    SELECT id FROM image_processor.day_processing
+                    WHERE processing_date = %s
+                """, (processing_date,))
+                day_id = cur.fetchone()[0]
 
-                pending = {}
-                for row in cur:
-                    border = row[1]
-                    if border not in pending:
-                        pending[border] = []
-                    pending[border].append(row[0])
+                cur.execute("""
+                    INSERT INTO image_processor.batch_log
+                    (processing_date, border, direction, batch_number,
+                     image_count, detection_count, last_image_path,
+                     day_processing_id, completed_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (processing_date, border, direction, batch_number)
+                    DO UPDATE SET
+                        image_count = EXCLUDED.image_count,
+                        detection_count = EXCLUDED.detection_count,
+                        last_image_path = EXCLUDED.last_image_path,
+                        completed_at = NOW()
+                """, (processing_date, border, direction, batch_number,
+                      image_count, detection_count, last_image_path, day_id))
+                conn.commit()
 
-                return pending
+    def mark_border_complete(self, processing_date: date, border: str, direction: str):
+        """Mark border/direction complete for day (updates JSONB array)."""
+        with self.db_manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                border_key = f"{border}/{direction}"
+                cur.execute("""
+                    UPDATE image_processor.day_processing
+                    SET borders_completed = borders_completed || %s::jsonb
+                    WHERE processing_date = %s
+                """, (json.dumps([border_key]), processing_date))
+                conn.commit()
 
-    def _transform_for_yolo(self, image_data: bytes) -> np.ndarray:
-        """Convert image bytes to numpy array for YOLO"""
-        nparr = np.frombuffer(image_data, np.uint8)
-        return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    def update_day_status(
+        self, processing_date: date, status: str,
+        hdfs_path: Optional[str] = None,
+        file_size_bytes: Optional[int] = None,
+        total_detections: Optional[int] = None
+    ):
+        """Update day status with completion results."""
+        with self.db_manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Aggregate batch metrics
+                cur.execute("""
+                    SELECT COUNT(*), COALESCE(SUM(image_count), 0)
+                    FROM image_processor.batch_log
+                    WHERE processing_date = %s
+                """, (processing_date,))
+                batch_count, image_count = cur.fetchone()
 
-    @retry_with_backoff()
-    def _download_single_image(self, blob_path: str) -> Tuple[str, np.ndarray]:
-        """
-        Download and process a single image from blob storage with retry.
+                cur.execute("""
+                    UPDATE image_processor.day_processing
+                    SET status = %s, hdfs_path = %s, file_size_bytes = %s,
+                        total_detections = %s, total_batches = %s, total_images = %s,
+                        completed_at = NOW()
+                    WHERE processing_date = %s
+                """, (status, hdfs_path, file_size_bytes, total_detections,
+                      batch_count, image_count, processing_date))
+                conn.commit()
+        self.logger.info(f"COMMIT TRANSACTION: Day {processing_date} marked {status}")
 
-        Args:
-            blob_path: Blob path to download
+    def mark_day_failed(self, processing_date: date, error_message: str):
+        """Mark day as FAILED (will be retried)."""
+        with self.db_manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE image_processor.day_processing
+                    SET status = 'FAILED', error_message = %s, last_error_time = NOW()
+                    WHERE processing_date = %s
+                """, (error_message, processing_date))
+                conn.commit()
+        self.logger.warning(f"ROLLBACK TRANSACTION: Day {processing_date} marked FAILED")
 
-        Returns:
-            Tuple of (blob_path, numpy array)
-        """
-        blob_client = self.container_client.get_blob_client(blob_path)
-        image_data = blob_client.download_blob().readall()
-        image = self._transform_for_yolo(image_data)
-        return blob_path, image
+    def mark_day_permanently_failed(self, processing_date: date, error_message: str):
+        """Mark day as PERMANENTLY_FAILED (will be skipped)."""
+        with self.db_manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE image_processor.day_processing
+                    SET status = 'PERMANENTLY_FAILED', error_message = %s, last_error_time = NOW()
+                    WHERE processing_date = %s
+                """, (error_message, processing_date))
+                conn.commit()
+        self.logger.error(f"Day {processing_date} marked PERMANENTLY_FAILED")
 
-    def download_images_parallel(
+    def get_day_retry_count(self, processing_date: date) -> int:
+        """Get retry count for a day."""
+        with self.db_manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT retry_count FROM image_processor.day_processing
+                    WHERE processing_date = %s
+                """, (processing_date,))
+                row = cur.fetchone()
+                return row[0] if row else 0
+
+    def increment_day_retry(self, processing_date: date):
+        """Increment retry count and reset status to PENDING for retry."""
+        with self.db_manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE image_processor.day_processing
+                    SET retry_count = retry_count + 1, status = 'PENDING', started_at = NULL
+                    WHERE processing_date = %s
+                """, (processing_date,))
+                conn.commit()
+
+    # =============================================================================
+    # HDFS IMAGE CACHING (For Retry Resilience)
+    # =============================================================================
+
+    def download_images_with_hdfs_cache(
         self,
-        blob_paths: List[str]
+        batch: List[str],
+        processing_date: date
     ) -> Tuple[List[np.ndarray], List[str], List[Tuple[str, str]]]:
         """
-        Download and process images from blob storage in parallel.
+        Download images with HDFS caching for retry resilience.
+
+        Strategy:
+        1. Check HDFS cache first: /hdfs/temp/images/{processing_date}/{blob_path}
+        2. If cached, read from HDFS (fast)
+        3. If not cached, download from Azure and save to HDFS
+        4. Return images for processing
 
         Args:
-            blob_paths: List of blob paths to download
+            batch: List of blob paths
+            processing_date: Date being processed (for cache directory)
 
         Returns:
-            Tuple of:
-                - List of numpy arrays (successfully downloaded images)
-                - List of blob paths (corresponding to successful downloads)
-                - List of (blob_path, error_message) for failed downloads
+            Tuple of (images, successful_paths, failed_downloads)
         """
         images = []
         successful_paths = []
         failed = []
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_path = {
-                executor.submit(self._download_single_image, path): path
-                for path in blob_paths
-            }
+        hdfs_cache_base = f"/hdfs/temp/images/{processing_date.strftime('%Y-%m-%d')}"
 
-            for future in as_completed(future_to_path):
-                path = future_to_path[future]
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {}
+
+            for blob_path in batch:
+                future = executor.submit(
+                    self._download_or_load_cached,
+                    blob_path,
+                    hdfs_cache_base
+                )
+                futures[future] = blob_path
+
+            for future in as_completed(futures):
+                path = futures[future]
                 try:
-                    _, image = future.result()
+                    image = future.result()
                     images.append(image)
                     successful_paths.append(path)
                 except Exception as e:
                     error_msg = str(e)
-                    self.logger.error(f"Error downloading {path}: {error_msg}")
+                    self.logger.error(f"Error loading {path}: {error_msg}")
                     failed.append((path, error_msg))
 
         # Sort by original order
-        path_order = {p: i for i, p in enumerate(blob_paths)}
+        path_order = {p: i for i, p in enumerate(batch)}
         sorted_pairs = sorted(
             zip(successful_paths, images),
             key=lambda x: path_order.get(x[0], float('inf'))
@@ -1041,22 +795,69 @@ class ImageLoader:
 
         return [], [], failed
 
-    def download_images(self, blob_paths: List[str]) -> List[np.ndarray]:
+    @retry_with_backoff()
+    def _download_or_load_cached(
+        self,
+        blob_path: str,
+        hdfs_cache_base: str
+    ) -> np.ndarray:
         """
-        Download and process images from blob storage.
-        Legacy method for backward compatibility - uses parallel download internally.
+        Load image from HDFS cache or download from Azure if not cached.
 
         Args:
-            blob_paths: List of blob paths to download
+            blob_path: Azure blob path (e.g., "HORGOS/I/2024/12/15/14-30-45.jpg")
+            hdfs_cache_base: HDFS cache directory (e.g., "/hdfs/temp/images/2024-12-15")
 
         Returns:
-            List of numpy arrays ready for YOLO
+            Image as numpy array
         """
-        images, successful_paths, failed = self.download_images_parallel(blob_paths)
+        hdfs_path = f"{hdfs_cache_base}/{blob_path}"
 
-        if failed:
-            self.logger.warning(f"{len(failed)} images failed to download")
-            if len(images) == 0:
-                raise Exception(f"All {len(blob_paths)} downloads failed. First error: {failed[0][1]}")
+        # Try HDFS cache first
+        try:
+            with self.hdfs_client.read(hdfs_path) as reader:
+                image_data = reader.read()
+                image = self._transform_for_yolo(image_data)
+                self.logger.debug(f"Loaded from HDFS cache: {blob_path}")
+                return image
+        except Exception:
+            # Not in cache, download from Azure
+            pass
 
-        return images
+        # Download from Azure
+        blob_client = self.container_client.get_blob_client(blob_path)
+        image_data = blob_client.download_blob().readall()
+        image = self._transform_for_yolo(image_data)
+
+        # Save to HDFS cache for future retries
+        try:
+            hdfs_dir = os.path.dirname(hdfs_path)
+            self.hdfs_client.makedirs(hdfs_dir, permission=755)
+            with self.hdfs_client.write(hdfs_path, overwrite=True) as writer:
+                writer.write(image_data)
+            self.logger.debug(f"Cached to HDFS: {blob_path}")
+        except Exception as e:
+            # Cache write failure is non-fatal (retry will re-download)
+            self.logger.warning(f"Failed to cache {blob_path} to HDFS: {e}")
+
+        return image
+
+    def cleanup_day_cache(self, processing_date: date):
+        """
+        Delete cached images for a day after completion or permanent failure.
+
+        Args:
+            processing_date: Date to clean up
+        """
+        hdfs_cache_dir = f"/hdfs/temp/images/{processing_date.strftime('%Y-%m-%d')}"
+
+        try:
+            self.hdfs_client.delete(hdfs_cache_dir, recursive=True)
+            self.logger.info(f"Cleaned up HDFS image cache for {processing_date}")
+        except Exception as e:
+            self.logger.warning(f"Failed to cleanup cache for {processing_date}: {e}")
+
+    def _transform_for_yolo(self, image_data: bytes) -> np.ndarray:
+        """Convert image bytes to numpy array for YOLO"""
+        nparr = np.frombuffer(image_data, np.uint8)
+        return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
