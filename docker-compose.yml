@@ -42,6 +42,7 @@ services:
     container_name: spark-master
     volumes:
       - ./src/batch:/batch
+      - ./src/queries:/queries
     ports:
       - 8080:8080
       - 7077:7077
@@ -167,33 +168,6 @@ services:
       - resourcemanager
       - historyserver
 
-  image-processor:
-    build:
-      context: ./src/image_processor
-    container_name: image-processor
-    volumes:
-      - ./src/image_processor:/app
-      - ./src/model:/app/model
-      - ./data:/data
-    env_file:
-      - ./src/config/config.env
-    environment:
-      - HDFS_NAMENODE=http://namenode:9870
-      - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING}
-      - POSTGRES_HOST=hive-metastore-postgresql
-      - POSTGRES_PORT=5432
-      - POSTGRES_DB=hive
-      - POSTGRES_USER=${POSTGRES_USER:-hive}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-hive}
-    depends_on:
-      namenode:
-        condition: service_started
-      datanode1:
-        condition: service_started
-      datanode2:
-        condition: service_started
-      hive-metastore-postgresql:
-        condition: service_healthy
 
 volumes:
   namenode:

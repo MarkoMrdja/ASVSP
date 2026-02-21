@@ -8,5 +8,7 @@ __pycache__
 logs
 .claude
 *.db
-storage/
+docs/records
 CLAUDE.md
+data/
+archive/
