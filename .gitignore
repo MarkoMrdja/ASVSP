@@ -5,10 +5,12 @@ __pycache__
 !.env.example
 .venv
 .vscode
-logs
 .claude
 *.db
 docs/records
 CLAUDE.md
 data/
 archive/
+
+# Collector logs — keep the logs/ directory, ignore the files inside
+src/stream/collector/logs/*.log

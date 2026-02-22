@@ -43,6 +43,7 @@ services:
     volumes:
       - ./src/batch:/batch
       - ./src/queries:/queries
+      - ./src/config/hive-site.xml:/spark/conf/hive-site.xml
     ports:
       - 8080:8080
       - 7077:7077
@@ -50,6 +51,12 @@ services:
       - PYSPARK_PYTHON=python3
     env_file:
       - ./src/config/config.env
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+        reservations:
+          memory: 1G
 
   spark-worker1:
     image: bde2020/spark-worker:3.0.1-hadoop3.2
@@ -58,16 +65,20 @@ services:
       - spark-master
     environment:
       - SPARK_MASTER=spark://spark-master:7077
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=2g
     ports:
       - 8081:8081
+    volumes:
+      - ./src/config/hive-site.xml:/spark/conf/hive-site.xml
     env_file:
       - ./src/config/config.env
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 3G
         reservations:
-          memory: 2G
+          memory: 1G
 
   spark-worker2:
     image: bde2020/spark-worker:3.0.1-hadoop3.2
@@ -76,16 +87,20 @@ services:
       - spark-master
     environment:
       - SPARK_MASTER=spark://spark-master:7077
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=2g
     ports:
       - 8082:8081
+    volumes:
+      - ./src/config/hive-site.xml:/spark/conf/hive-site.xml
     env_file:
       - ./src/config/config.env
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 3G
         reservations:
-          memory: 2G
+          memory: 1G
 
   hive-server:
     image: bde2020/hive:2.3.2-postgresql-metastore
