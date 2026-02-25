@@ -184,8 +184,8 @@ services:
     networks:
       - asvsp_network
     depends_on:
-      namenode:
-        condition: service_healthy
+      - namenode
+    restart: on-failure
     environment:
       SERVICE_PRECONDITION: "namenode:9870"
     env_file:
