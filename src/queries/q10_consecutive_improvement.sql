@@ -1,3 +1,4 @@
+-- Q10: Top 15 država s najdužim nizom uzastopnih mjeseci opadanja PM2.5
 WITH with_prev AS (
     SELECT
         state_name,
@@ -7,7 +8,7 @@ WITH with_prev AS (
         LAG(monthly_avg) OVER (
             PARTITION BY state_name
             ORDER BY year, month
-        ) AS prev_month_avg
+        ) AS prosjek_prethodnog_mjeseca
     FROM monthly_state_measurements
     WHERE pollutant = 'PM25'
 ),
@@ -17,8 +18,8 @@ with_improvement AS (
         year,
         month,
         monthly_avg,
-        prev_month_avg,
-        CASE WHEN monthly_avg < prev_month_avg THEN 1 ELSE 0 END AS is_improvement
+        prosjek_prethodnog_mjeseca,
+        CASE WHEN monthly_avg < prosjek_prethodnog_mjeseca THEN 1 ELSE 0 END AS je_poboljsanje
     FROM with_prev
 ),
 with_groups AS (
@@ -26,26 +27,27 @@ with_groups AS (
         state_name,
         year,
         month,
-        is_improvement,
-        SUM(CASE WHEN is_improvement = 0 THEN 1 ELSE 0 END) OVER (
+        je_poboljsanje,
+        SUM(CASE WHEN je_poboljsanje = 0 THEN 1 ELSE 0 END) OVER (
             PARTITION BY state_name
             ORDER BY year, month
-        ) AS streak_group
+        ) AS grupa_niza
     FROM with_improvement
 ),
 streak_lengths AS (
     SELECT
         state_name,
-        streak_group,
-        COUNT(*) AS streak_length,
-        MIN(year * 100 + month) AS streak_start
+        grupa_niza,
+        COUNT(*)                    AS duzina_niza,
+        MIN(year * 100 + month)     AS pocetak_niza
     FROM with_groups
-    WHERE is_improvement = 1
-    GROUP BY state_name, streak_group
+    WHERE je_poboljsanje = 1
+    GROUP BY state_name, grupa_niza
 )
 SELECT
-    state_name,
-    MAX(streak_length) AS longest_streak
+    state_name              AS drzava,
+    MAX(duzina_niza)        AS najduzi_niz_mjeseci
 FROM streak_lengths
 GROUP BY state_name
-ORDER BY longest_streak DESC;
+ORDER BY najduzi_niz_mjeseci DESC
+LIMIT 15;
