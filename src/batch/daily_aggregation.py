@@ -29,7 +29,7 @@ daily_df = daily_df.withColumn("month", F.month("date_local"))
 
 OUTPUT_PATH = f"{HDFS_NAMENODE}{WAREHOUSE}/daily_state_measurements"
 
-daily_df.write.mode("overwrite").partitionBy("pollutant").parquet(OUTPUT_PATH)
+daily_df.write.mode("overwrite").partitionBy("pollutant", "year", "month").parquet(OUTPUT_PATH)
 
 # Register/refresh external table in Hive metastore
 spark.sql("DROP TABLE IF EXISTS daily_state_measurements")
@@ -42,11 +42,9 @@ spark.sql(f"""
         daily_max DOUBLE,
         measurement_count INT,
         is_weekend BOOLEAN,
-        day_of_week INT,
-        year INT,
-        month INT
+        day_of_week INT
     )
-    PARTITIONED BY (pollutant STRING)
+    PARTITIONED BY (pollutant STRING, year INT, month INT)
     STORED AS PARQUET
     LOCATION '{OUTPUT_PATH}'
 """)

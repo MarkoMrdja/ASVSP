@@ -23,7 +23,7 @@ SPARK_SUBMIT_PG = (
     "docker exec spark-master /spark/bin/spark-submit"
     " --master spark://spark-master:7077"
     " --driver-memory 1g"
-    " --executor-memory 1g"
+    " --executor-memory 2g"
     " --executor-cores 2"
     " --num-executors 2"
     " --conf spark.sql.shuffle.partitions=8"

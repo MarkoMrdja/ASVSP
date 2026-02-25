@@ -54,7 +54,7 @@ monthly_df = monthly_df.withColumn( "yoy_month_change", F.round(F.col("monthly_a
 
 OUTPUT_PATH = f"{HDFS_NAMENODE}{WAREHOUSE}/monthly_state_measurements"
 
-monthly_df.write.mode("overwrite").partitionBy("pollutant").parquet(OUTPUT_PATH)
+monthly_df.write.mode("overwrite").partitionBy("pollutant", "year").parquet(OUTPUT_PATH)
 
 # Register/refresh external table in Hive metastore
 spark.sql("DROP TABLE IF EXISTS monthly_state_measurements")
@@ -62,7 +62,6 @@ spark.sql("DROP TABLE IF EXISTS monthly_state_measurements")
 spark.sql(f"""
     CREATE EXTERNAL TABLE IF NOT EXISTS monthly_state_measurements (
         state_name STRING,
-        year INT,
         month INT,
         monthly_avg DOUBLE,
         monthly_max DOUBLE,
@@ -73,7 +72,7 @@ spark.sql(f"""
         same_month_prev_year_avg DOUBLE,
         yoy_month_change DOUBLE
     )
-    PARTITIONED BY (pollutant STRING)
+    PARTITIONED BY (pollutant STRING, year INT)
     STORED AS PARQUET
     LOCATION '{OUTPUT_PATH}'
 """)

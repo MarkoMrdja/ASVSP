@@ -14,10 +14,10 @@ JDBC_URL = "jdbc:postgresql://pg:5432/streaming"
 JDBC_DRIVER = "org.postgresql.Driver"
 
 EXPORTS = [
-    ("/queries/q01_state_ranking_yoy.sql",     "batch_q01_state_ranking"),
-    ("/queries/q03_cumulative_exceedances.sql", "batch_q03_exceedances"),
-    ("/queries/q08_covid_impact.sql",           "batch_q08_covid_impact"),
-    ("/queries/q09_weekend_effect.sql",         "batch_q09_weekend_effect"),
+    ("/queries/q01_state_ranking_yoy.sql",          "batch_q01_state_ranking"),
+    ("/queries/q08_covid_impact.sql",               "batch_q08_covid_impact"),
+    ("/queries/q09_weekend_effect.sql",             "batch_q09_weekend_effect"),
+    ("/queries/q10_consecutive_improvement.sql",    "batch_q10_improvement"),
 ]
 
 for sql_file, table_name in EXPORTS:

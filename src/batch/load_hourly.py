@@ -33,13 +33,6 @@ for pollutant_name in pollutants:
             if normalized != col_name:
                 df = df.withColumnRenamed(col_name, normalized)
 
-        df = df.withColumn(
-            "site_id",
-            (F.col("State_Code").cast("int") * 10000000 +
-             F.col("County_Code").cast("int") * 10000 +
-             F.col("Site_Num").cast("int")).cast("long")
-        )
-
         df = df.withColumn("hour_local", F.substring(F.col("Time_Local"), 1, 2).cast("int"))
 
         if pollutant_name in ("NO2", "SO2"):
@@ -47,8 +40,31 @@ for pollutant_name in pollutants:
         else:
             raw_measurement = F.col("Sample_Measurement").cast("double")
 
+        # Fix truncated state names from older EPA CSV files (9-char column limit)
+        df = df.withColumn(
+            "State_Name",
+            F.when(F.col("State_Name") == "Californi",  F.lit("California"))
+             .when(F.col("State_Name") == "Connectic",  F.lit("Connecticut"))
+             .when(F.col("State_Name") == "Country O",  F.lit("Country Of Mexico"))
+             .when(F.col("State_Name") == "District",   F.lit("District Of Columbia"))
+             .when(F.col("State_Name") == "Massachus",  F.lit("Massachusetts"))
+             .when(F.col("State_Name") == "Mississip",  F.lit("Mississippi"))
+             .when(F.col("State_Name") == "New Hamps",  F.lit("New Hampshire"))
+             .when(F.col("State_Name") == "New Jerse",  F.lit("New Jersey"))
+             .when(F.col("State_Name") == "New Mexic",  F.lit("New Mexico"))
+             .when(F.col("State_Name") == "North Car",  F.lit("North Carolina"))
+             .when(F.col("State_Name") == "North Dak",  F.lit("North Dakota"))
+             .when(F.col("State_Name") == "Pennsylva",  F.lit("Pennsylvania"))
+             .when(F.col("State_Name") == "Puerto Ri",  F.lit("Puerto Rico"))
+             .when(F.col("State_Name") == "Rhode Isl",  F.lit("Rhode Island"))
+             .when(F.col("State_Name") == "South Car",  F.lit("South Carolina"))
+             .when(F.col("State_Name") == "South Dak",  F.lit("South Dakota"))
+             .when(F.col("State_Name") == "Washingto",  F.lit("Washington"))
+             .when(F.col("State_Name") == "West Virg",  F.lit("West Virginia"))
+             .otherwise(F.col("State_Name"))
+        )
+
         df = df.select(
-            F.col("site_id"),
             F.col("State_Code").cast("int").alias("state_code"),
             F.col("County_Code").cast("int").alias("county_code"),
             F.col("Site_Num").cast("int").alias("site_num"),
@@ -72,7 +88,6 @@ spark.sql("DROP TABLE IF EXISTS hourly_measurements")
 
 spark.sql(f"""
     CREATE EXTERNAL TABLE IF NOT EXISTS hourly_measurements (
-        site_id BIGINT,
         state_code INT,
         county_code INT,
         site_num INT,
