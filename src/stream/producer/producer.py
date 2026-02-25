@@ -9,8 +9,7 @@ from kafka.errors import NoBrokersAvailable
 
 KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "kafka1:19092")
 DB_PATH = os.environ.get("DB_PATH", "/data/measurements.db")
-STREAM_INTERVAL = float(os.environ.get("STREAM_INTERVAL_SECONDS", "2"))
-REPLAY_PAUSE = float(os.environ.get("REPLAY_PAUSE_SECONDS", "5"))
+HOUR_INTERVAL = float(os.environ.get("STREAM_INTERVAL_SECONDS", "1"))
 
 AQ_TOPIC = "air_quality_stream"
 WX_TOPIC = "weather_stream"
@@ -32,10 +31,11 @@ def connect_kafka():
 
 
 def load_aq_rows(conn):
-    """Return air quality rows grouped by collected_at timestamp."""
+    """Return air quality rows grouped by hour bucket (YYYY-MM-DD HH)."""
     cur = conn.execute(
         """
         SELECT
+            strftime('%Y-%m-%d %H', collected_at) AS hour_bucket,
             collected_at,
             city,
             state,
@@ -49,13 +49,13 @@ def load_aq_rows(conn):
             so2,
             co
         FROM air_quality
-        ORDER BY collected_at
+        ORDER BY hour_bucket, collected_at
         """
     )
-    rows_by_ts = defaultdict(list)
+    rows_by_hour = defaultdict(list)
     for row in cur.fetchall():
-        ts, city, state, aqi, aqi_cat, dom_poll, pm25, pm10, o3, no2, so2, co = row
-        rows_by_ts[ts].append(
+        hour, ts, city, state, aqi, aqi_cat, dom_poll, pm25, pm10, o3, no2, so2, co = row
+        rows_by_hour[hour].append(
             {
                 "timestamp": ts,
                 "city": city,
@@ -71,14 +71,15 @@ def load_aq_rows(conn):
                 "co": co,
             }
         )
-    return rows_by_ts
+    return rows_by_hour
 
 
 def load_wx_rows(conn):
-    """Return weather rows grouped by collected_at timestamp."""
+    """Return weather rows grouped by hour bucket (YYYY-MM-DD HH)."""
     cur = conn.execute(
         """
         SELECT
+            strftime('%Y-%m-%d %H', collected_at) AS hour_bucket,
             collected_at,
             city,
             state,
@@ -90,13 +91,13 @@ def load_wx_rows(conn):
             cloud_cover_pct,
             precipitation_mm
         FROM weather
-        ORDER BY collected_at
+        ORDER BY hour_bucket, collected_at
         """
     )
-    rows_by_ts = defaultdict(list)
+    rows_by_hour = defaultdict(list)
     for row in cur.fetchall():
-        ts, city, state, temp, hum, wind_spd, wind_dir, pres, cloud, precip = row
-        rows_by_ts[ts].append(
+        hour, ts, city, state, temp, hum, wind_spd, wind_dir, pres, cloud, precip = row
+        rows_by_hour[hour].append(
             {
                 "timestamp": ts,
                 "city": city,
@@ -110,7 +111,7 @@ def load_wx_rows(conn):
                 "precipitation_mm": precip,
             }
         )
-    return rows_by_ts
+    return rows_by_hour
 
 
 def main():
@@ -119,43 +120,39 @@ def main():
     conn = sqlite3.connect(DB_PATH)
     print(f"Opened SQLite DB at {DB_PATH}", flush=True)
 
-    aq_by_ts = load_aq_rows(conn)
-    wx_by_ts = load_wx_rows(conn)
+    aq_by_hour = load_aq_rows(conn)
+    wx_by_hour = load_wx_rows(conn)
     conn.close()
 
-    all_timestamps = sorted(set(aq_by_ts.keys()) | set(wx_by_ts.keys()))
+    all_hours = sorted(set(aq_by_hour.keys()) | set(wx_by_hour.keys()))
 
-    if not all_timestamps:
+    if not all_hours:
         print("No data in DB, exiting.", flush=True)
         return
 
-    print(f"Streaming {len(all_timestamps)} timestamps to Kafka (looping forever)...", flush=True)
+    print(f"Streaming {len(all_hours)} hours to Kafka...", flush=True)
 
-    loop = 0
-    while True:
-        loop += 1
-        print(f"--- Loop {loop}: replaying {len(all_timestamps)} timestamps ---", flush=True)
-        for ts in all_timestamps:
-            aq_rows = aq_by_ts.get(ts, [])
-            wx_rows = wx_by_ts.get(ts, [])
+    for hour in all_hours:
+        aq_rows = aq_by_hour.get(hour, [])
+        wx_rows = wx_by_hour.get(hour, [])
 
-            for row in aq_rows:
-                key = f"{row['city']}_{row['state']}"
-                producer.send(AQ_TOPIC, key=key, value=row)
+        for row in aq_rows:
+            key = f"{row['city']}_{row['state']}"
+            producer.send(AQ_TOPIC, key=key, value=row)
 
-            for row in wx_rows:
-                key = f"{row['city']}_{row['state']}"
-                producer.send(WX_TOPIC, key=key, value=row)
+        for row in wx_rows:
+            key = f"{row['city']}_{row['state']}"
+            producer.send(WX_TOPIC, key=key, value=row)
 
-            producer.flush()
-            print(
-                f"Sent ts={ts}: {len(aq_rows)} AQ rows, {len(wx_rows)} WX rows",
-                flush=True,
-            )
-            time.sleep(STREAM_INTERVAL)
+        producer.flush()
+        print(
+            f"Sent hour={hour}: {len(aq_rows)} AQ rows, {len(wx_rows)} WX rows",
+            flush=True,
+        )
+        time.sleep(HOUR_INTERVAL)
 
-        print(f"--- Loop {loop} complete. Pausing {REPLAY_PAUSE}s before next replay ---", flush=True)
-        time.sleep(REPLAY_PAUSE)
+    producer.close()
+    print("All hours streamed. Producer exiting.", flush=True)
 
 
 if __name__ == "__main__":

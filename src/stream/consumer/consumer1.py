@@ -57,7 +57,9 @@ baselines = (
         col("is_weekend").alias("bl_is_weekend"),
         col("baseline_avg"),
     )
+    .cache()
 )
+baselines.count()  # materialise cache before stream starts
 
 aq_state = (
     aq

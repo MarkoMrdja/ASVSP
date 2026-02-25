@@ -1,7 +1,13 @@
+networks:
+  asvsp_network:
+    driver: bridge
+
 services:
   namenode:
     image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
     container_name: namenode
+    networks:
+      - asvsp_network
     volumes:
       - namenode:/hadoop/dfs/name
       - ./src/test:/test
@@ -20,6 +26,8 @@ services:
   datanode1:
     image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
     container_name: datanode1
+    networks:
+      - asvsp_network
     volumes:
       - datanode1:/hadoop/dfs/data
     env_file:
@@ -30,6 +38,8 @@ services:
   datanode2:
     image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
     container_name: datanode2
+    networks:
+      - asvsp_network
     volumes:
       - datanode2:/hadoop/dfs/data
     env_file:
@@ -40,6 +50,8 @@ services:
   spark-master:
     image: bde2020/spark-master:3.0.1-hadoop3.2
     container_name: spark-master
+    networks:
+      - asvsp_network
     volumes:
       - ./src/batch:/batch
       - ./src/queries:/queries
@@ -62,12 +74,14 @@ services:
   spark-worker1:
     image: bde2020/spark-worker:3.0.1-hadoop3.2
     container_name: spark-worker1
+    networks:
+      - asvsp_network
     depends_on:
       - spark-master
     environment:
       - SPARK_MASTER=spark://spark-master:7077
       - SPARK_WORKER_CORES=2
-      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_MEMORY=4g
     ports:
       - 8081:8081
     volumes:
@@ -77,19 +91,21 @@ services:
     deploy:
       resources:
         limits:
-          memory: 3G
+          memory: 5G
         reservations:
-          memory: 1G
+          memory: 2G
 
   spark-worker2:
     image: bde2020/spark-worker:3.0.1-hadoop3.2
     container_name: spark-worker2
+    networks:
+      - asvsp_network
     depends_on:
       - spark-master
     environment:
       - SPARK_MASTER=spark://spark-master:7077
       - SPARK_WORKER_CORES=2
-      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_MEMORY=4g
     ports:
       - 8082:8081
     volumes:
@@ -99,13 +115,15 @@ services:
     deploy:
       resources:
         limits:
-          memory: 3G
+          memory: 5G
         reservations:
-          memory: 1G
+          memory: 2G
 
   hive-server:
     image: bde2020/hive:2.3.2-postgresql-metastore
     container_name: hive-server
+    networks:
+      - asvsp_network
     env_file:
       - ./src/config/config.env
     environment:
@@ -114,9 +132,28 @@ services:
     ports:
       - "10000:10000"
 
+  hive-init:
+    image: bde2020/hive:2.3.2-postgresql-metastore
+    container_name: hive-init
+    networks:
+      - asvsp_network
+    depends_on:
+      hive-metastore-postgresql:
+        condition: service_healthy
+    entrypoint: /bin/bash
+    command: /scripts/init_hive_schema.sh
+    volumes:
+      - ./src/scripts:/scripts
+    restart: "no"
+
   hive-metastore:
     image: bde2020/hive:2.3.2-postgresql-metastore
     container_name: hive-metastore
+    networks:
+      - asvsp_network
+    depends_on:
+      hive-init:
+        condition: service_completed_successfully
     env_file:
       - ./src/config/config.env
     command: /opt/hive/bin/hive --service metastore
@@ -128,6 +165,8 @@ services:
   hive-metastore-postgresql:
     image: bde2020/hive-metastore-postgresql:2.3.0
     container_name: hive-metastore-postgresql
+    networks:
+      - asvsp_network
     restart: unless-stopped
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-hive}
@@ -142,6 +181,11 @@ services:
   resourcemanager:
     image: bde2020/hadoop-resourcemanager:2.0.0-hadoop3.2.1-java8
     container_name: resourcemanager
+    networks:
+      - asvsp_network
+    depends_on:
+      namenode:
+        condition: service_healthy
     environment:
       SERVICE_PRECONDITION: "namenode:9870"
     env_file:
@@ -155,6 +199,13 @@ services:
   nodemanager:
     image: bde2020/hadoop-nodemanager:2.0.0-hadoop3.2.1-java8
     container_name: nodemanager
+    networks:
+      - asvsp_network
+    depends_on:
+      namenode:
+        condition: service_healthy
+      resourcemanager:
+        condition: service_healthy
     environment:
       SERVICE_PRECONDITION: "namenode:9870 resourcemanager:8088"
     env_file:
@@ -163,6 +214,13 @@ services:
   historyserver:
     image: bde2020/hadoop-historyserver:2.0.0-hadoop3.2.1-java8
     container_name: historyserver
+    networks:
+      - asvsp_network
+    depends_on:
+      namenode:
+        condition: service_healthy
+      resourcemanager:
+        condition: service_healthy
     environment:
       SERVICE_PRECONDITION: "namenode:9870 resourcemanager:8088"
     env_file:
@@ -174,6 +232,8 @@ services:
     image: gethue/hue:20201111-135001
     hostname: hue
     container_name: hue
+    networks:
+      - asvsp_network
     dns: 8.8.8.8
     ports:
       - "8888:8888"
@@ -187,6 +247,8 @@ services:
   zoo1:
     image: zookeeper:3.4.9
     container_name: zoo1
+    networks:
+      - asvsp_network
     ports:
       - "2181:2181"
     environment:
@@ -201,6 +263,8 @@ services:
     image: confluentinc/cp-kafka:5.5.12
     platform: linux/amd64
     container_name: kafka1
+    networks:
+      - asvsp_network
     restart: on-failure
     ports:
       - "9092:9092"
@@ -221,6 +285,8 @@ services:
     image: confluentinc/cp-kafka:5.5.12
     platform: linux/amd64
     container_name: kafka2
+    networks:
+      - asvsp_network
     restart: on-failure
     ports:
       - "9093:9093"
@@ -240,6 +306,8 @@ services:
   pg:
     image: postgres:15
     container_name: pg
+    networks:
+      - asvsp_network
     restart: always
     environment:
       POSTGRES_USER: postgres
@@ -253,6 +321,8 @@ services:
   metabase:
     image: metabase/metabase:latest
     container_name: metabase
+    networks:
+      - asvsp_network
     restart: always
     environment:
       MB_DB_TYPE: postgres
@@ -271,9 +341,14 @@ services:
   producer:
     build: ./src/stream/producer
     container_name: kafka_producer
+    networks:
+      - asvsp_network
+    restart: "no"
+    profiles:
+      - manual
     environment:
       KAFKA_BROKER: kafka1:19092
-      STREAM_INTERVAL_SECONDS: 0.1
+      STREAM_INTERVAL_SECONDS: 0.3
       DB_PATH: /data/measurements.db
     volumes:
       - ./data/streaming:/data
@@ -281,6 +356,122 @@ services:
       - kafka1
       - kafka2
 
+  airflow-postgres:
+    image: postgres:15
+    container_name: airflow-postgres
+    networks:
+      - asvsp_network
+    restart: always
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5433:5432"
+    volumes:
+      - airflow_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  airflow-init:
+    build: ./airflow
+    container_name: airflow-init
+    networks:
+      - asvsp_network
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+    env_file:
+      - ./src/config/airflow.env
+    environment:
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./airflow/config:/opt/airflow/config
+      - ./src/scripts:/opt/airflow/scripts
+      - ./data:/opt/airflow/data
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create \
+          --username airflow \
+          --firstname Airflow \
+          --lastname Admin \
+          --role Admin \
+          --email admin@example.com \
+          --password airflow || true
+    restart: "no"
+
+  airflow-webserver:
+    build: ./airflow
+    container_name: airflow-webserver
+    networks:
+      - asvsp_network
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    env_file:
+      - ./src/config/airflow.env
+    ports:
+      - "8090:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./airflow/config:/opt/airflow/config
+      - ./src/scripts:/opt/airflow/scripts
+      - ./data:/opt/airflow/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/local/bin/docker:/usr/local/bin/docker
+    command: webserver
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  airflow-scheduler:
+    build: ./airflow
+    container_name: airflow-scheduler
+    networks:
+      - asvsp_network
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    env_file:
+      - ./src/config/airflow.env
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./airflow/config:/opt/airflow/config
+      - ./src/scripts:/opt/airflow/scripts
+      - ./data:/opt/airflow/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/local/bin/docker:/usr/local/bin/docker
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
 
 volumes:
   namenode:
@@ -292,3 +483,4 @@ volumes:
   kafka2:
   pg:
   mb:
+  airflow_pg:
