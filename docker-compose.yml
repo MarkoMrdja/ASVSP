@@ -239,10 +239,29 @@ services:
       - "8888:8888"
     volumes:
       - ./src/config/hue_config:/usr/share/hue/desktop/conf
+      - ./src/queries:/queries
+      - ./src/scripts:/scripts
     depends_on:
       - namenode
       - resourcemanager
       - historyserver
+      - livy
+
+  livy:
+    build: ./src/livy
+    container_name: livy
+    networks:
+      - asvsp_network
+    ports:
+      - "8998:8998"
+    volumes:
+      - ./src/config/hive-site.xml:/spark/conf/hive-site.xml
+    environment:
+      - PYSPARK_PYTHON=python3
+    depends_on:
+      - spark-master
+      - hive-metastore
+    restart: unless-stopped
 
   zoo1:
     image: zookeeper:3.4.9

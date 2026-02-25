@@ -19,6 +19,18 @@ SPARK_SUBMIT = (
     " --conf spark.sql.adaptive.coalescePartitions.enabled=true"
 )
 
+SPARK_SUBMIT_PG = (
+    "docker exec spark-master /spark/bin/spark-submit"
+    " --master spark://spark-master:7077"
+    " --driver-memory 1g"
+    " --executor-memory 1g"
+    " --executor-cores 2"
+    " --num-executors 2"
+    " --conf spark.sql.shuffle.partitions=8"
+    " --conf spark.sql.adaptive.enabled=true"
+    " --jars /stream/consumer/postgresql-42.5.1.jar"
+)
+
 with DAG(
     dag_id="asvsp_batch_pipeline",
     schedule=None,
@@ -52,10 +64,16 @@ with DAG(
         bash_command=f"{SPARK_SUBMIT} /batch/baselines.py",
     )
 
+    spark_export_postgres = BashOperator(
+        task_id="spark_export_to_postgres",
+        bash_command=f"{SPARK_SUBMIT_PG} /batch/export_to_postgres.py",
+    )
+
     (
         spark_load_hourly
         >> spark_daily_aggregation
         >> spark_monthly_aggregation
         >> spark_annual_aggregation
         >> spark_baselines
+        >> spark_export_postgres
     )
