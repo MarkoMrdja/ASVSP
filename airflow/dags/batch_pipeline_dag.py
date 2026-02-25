@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.operators.bash import BashOperator
@@ -31,42 +31,54 @@ SPARK_SUBMIT_PG = (
     " --jars /stream/consumer/postgresql-42.5.1.jar"
 )
 
+DEFAULT_ARGS = {
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
+
 with DAG(
     dag_id="asvsp_batch_pipeline",
     schedule=None,
-    start_date=datetime(2024, 1, 1),
+    start_date=datetime(2026, 1, 1),
     catchup=False,
     tags=["asvsp", "batch"],
+    default_args=DEFAULT_ARGS,
 ) as dag:
 
     spark_load_hourly = BashOperator(
         task_id="spark_load_hourly",
         bash_command=f"{SPARK_SUBMIT} /batch/load_hourly.py",
+        execution_timeout=timedelta(hours=2),
     )
 
     spark_daily_aggregation = BashOperator(
         task_id="spark_daily_aggregation",
         bash_command=f"{SPARK_SUBMIT} /batch/daily_aggregation.py",
+        execution_timeout=timedelta(minutes=30),
     )
 
     spark_monthly_aggregation = BashOperator(
         task_id="spark_monthly_aggregation",
         bash_command=f"{SPARK_SUBMIT} /batch/monthly_aggregation.py",
+        execution_timeout=timedelta(minutes=30),
     )
 
     spark_annual_aggregation = BashOperator(
         task_id="spark_annual_aggregation",
         bash_command=f"{SPARK_SUBMIT} /batch/annual_aggregation.py",
+        execution_timeout=timedelta(minutes=30),
     )
 
     spark_baselines = BashOperator(
         task_id="spark_baselines",
         bash_command=f"{SPARK_SUBMIT} /batch/baselines.py",
+        execution_timeout=timedelta(minutes=30),
     )
 
     spark_export_postgres = BashOperator(
         task_id="spark_export_to_postgres",
         bash_command=f"{SPARK_SUBMIT_PG} /batch/export_to_postgres.py",
+        execution_timeout=timedelta(minutes=15),
     )
 
     (
